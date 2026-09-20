@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "id": "lancefaul.omarcal",
+  "name": "omarcal",
+  "version": "1.0.0",
+  "author": "lancefaul",
+  "license": "MIT",
+  "description": "Your iCloud calendar in the bar: month, week and day views, an event viewer and search. Read-only for now \u2014 editing and more providers are coming.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "omarcal",
+    "description": "Clock with a CalDAV calendar popup: month, week and day",
+    "category": "Time",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "format": "dddd, MMMM d, yyyy '\u2022' hh:mm:ss AP",
+      "verticalFormat": "HH\nmm\nss",
+      "weekStartDay": 0,
+      "timeFormat": "12h",
+      "showWeekNumbers": false,
+      "refreshMinutes": 15,
+      "wrapEvents": false,
+      "dayStartHour": 0,
+      "dayEndHour": 24,
+      "updateCheck": true,
+      "updateDismissed": "",
+      "updateCheckedAt": 0,
+      "updateAttempt": ""
+    },
+    "schema": []
+  }
+}

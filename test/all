@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Every test omarcal has. Needs Qt6's qmltestrunner; no display required.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+export QT_QPA_PLATFORM=offscreen QML_XHR_ALLOW_FILE_READ=1
+runner=/usr/lib/qt6/bin/qmltestrunner
+[ -x "$runner" ] || { echo "qmltestrunner not found at $runner"; exit 127; }
+
+status=0
+for suite in tests/tst_*.qml; do
+  printf '\n== %s\n' "$suite"
+  output=$("$runner" -input "$suite" 2>&1)
+  grep -E 'FAIL|Totals' <<<"$output"
+  grep -q 'FAIL' <<<"$output" && status=1
+done
+
+printf '\n'
+[ $status -eq 0 ] && echo "all suites passed" || echo "FAILURES"
+exit $status

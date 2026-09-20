@@ -1,0 +1,1278 @@
+#!/usr/bin/env python3
+"""omarcal-helper — the omarcal backend.
+
+Talks CalDAV directly over pooled HTTPS connections instead of going through
+Evolution Data Server, so every request carries a real socket timeout and a
+slow calendar degrades to an error on that calendar alone. Parsing, recurrence
+expansion and VTIMEZONE handling come from libical (ICalGLib), a standalone
+package that needs nothing from pip.
+
+Every command prints one JSON object on stdout and exits 0; failures are
+reported inside that object rather than by exit status, so the QML side always
+has something to parse.
+
+    login      --user U                  store a password, discover calendars
+    calendars                            the calendar list and its state
+    set-calendar --calendar C ...        colour / visibility / rename
+    sync       [--calendar C] [--force]  incremental pull, all calendars at once
+    events     --from ISO --to ISO       occurrences in a window
+    event      --uid U [--rid R]         one event, every field
+    search     --query Q [--limit N]     title/location/description match
+    agenda     [--days N]                what is coming up
+    status                               health, last sync, per-calendar errors
+    settings   [--set k=v ...]           UI preferences
+    watch      [--interval S]            refresh loop, one JSON line per change
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import http.client
+import json
+import os
+import re
+import sqlite3
+import ssl
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
+from xml.etree import ElementTree as ET
+
+import gi
+
+gi.require_version("ICalGLib", "4.0")
+from gi.repository import ICalGLib as ICal  # noqa: E402
+
+NS = {
+    "d": "DAV:",
+    "c": "urn:ietf:params:xml:ns:caldav",
+    "cs": "http://calendarserver.org/ns/",
+    "a": "http://apple.com/ns/ical/",
+}
+
+ICLOUD = "https://caldav.icloud.com/"
+
+REQUEST_TIMEOUT = 45.0
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+MULTIGET_BATCH = 64
+# iCloud tolerates a handful of parallel requests per account comfortably.
+# Higher than this buys nothing and risks throttling.
+SYNC_WORKERS = 4
+MAX_EXPAND = 20000
+
+KEYRING_SCHEMA = "org.omarchy.omarcal"
+
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "omarcal"
+)
+DB_PATH = os.path.join(STATE_DIR, "cache.db")
+
+LOCAL_TZ = datetime.now().astimezone().tzinfo
+
+MEETING_PATTERNS = [
+    ("zoom", re.compile(r"https://[\w.-]*zoom\.us/\S+", re.I)),
+    ("meet", re.compile(r"https://meet\.google\.com/\S+", re.I)),
+    ("teams", re.compile(r"https://teams\.microsoft\.com/\S+", re.I)),
+    ("webex", re.compile(r"https://[\w.-]*webex\.com/\S+", re.I)),
+]
+
+# The panel's preferences, and the only copy of them. The widget manifest
+# still carries the same keys as `defaults` so a fresh install has something
+# before the helper has ever been asked; anything a person changes is stored
+# here, because shell.json is the shell's file and a plugin cannot write it.
+DEFAULT_SETTINGS = {
+    "weekStartDay": 0,
+    "timeFormat": "12h",
+    "defaultView": "month",
+    "showWeekNumbers": False,
+    "refreshMinutes": 15,
+    # The bar clock's face. Qt format strings, read by BarWidget.qml.
+    "format": "dddd, MMMM d, yyyy '\u2022' hh:mm:ss AP",
+    "verticalFormat": "HH\nmm\nss",
+    # Whether a long title or address in the day panel wraps or is cut off.
+    "wrapEvents": False,
+    # The slice of a day the day and week rails show. The end runs to 24,
+    # which is midnight of the next day.
+    "dayStartHour": 0,
+    "dayEndHour": 24,
+}
+
+
+# ---------------------------------------------------------------- credentials
+
+
+def load_password(account: str) -> str:
+    override = os.environ.get("OMARCAL_PASSWORD")
+    if override:
+        return override
+    try:
+        done = subprocess.run(
+            ["secret-tool", "lookup", "schema", KEYRING_SCHEMA, "account", account],
+            capture_output=True, text=True, timeout=10,
+        )
+        if done.returncode == 0 and done.stdout:
+            return done.stdout.strip("\n")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    raise Failure("no-password", f"no stored password for {account}")
+
+
+def forget_password(account: str) -> None:
+    try:
+        subprocess.run(
+            ["secret-tool", "clear", "schema", KEYRING_SCHEMA, "account", account],
+            capture_output=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def stored_password(account: str) -> str:
+    """The password held for an account, or "" when there is none."""
+    try:
+        done = subprocess.run(
+            ["secret-tool", "lookup", "schema", KEYRING_SCHEMA, "account", account],
+            capture_output=True, text=True, timeout=10,
+        )
+        if done.returncode == 0 and done.stdout:
+            return done.stdout.strip("\n")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
+def store_password(account: str, password: str) -> None:
+    subprocess.run(
+        ["secret-tool", "store", "--label", f"omarcal ({account})",
+         "schema", KEYRING_SCHEMA, "account", account],
+        input=password, text=True, check=True, timeout=10,
+    )
+
+
+class Failure(Exception):
+    """An error worth reporting to the UI verbatim."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+# ------------------------------------------------------------------ transport
+
+
+class DavSession:
+    """Pooled HTTPS connections, one per thread per host.
+
+    Reusing the connection is the single biggest win on a cold sync: a large
+    calendar is dozens of multiget requests, and a fresh TLS handshake on each
+    one dominated the time before this.
+    """
+
+    def __init__(self, user: str, password: str):
+        token = base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
+        self.headers = {
+            "Authorization": f"Basic {token}",
+            "User-Agent": "omarcal/0.1",
+            "Content-Type": "application/xml; charset=utf-8",
+        }
+        self._local = threading.local()
+        self._context = ssl.create_default_context()
+
+    def _connection(self, host: str) -> http.client.HTTPSConnection:
+        pool = getattr(self._local, "pool", None)
+        if pool is None:
+            pool = self._local.pool = {}
+        conn = pool.get(host)
+        if conn is None:
+            conn = pool[host] = http.client.HTTPSConnection(
+                host, timeout=REQUEST_TIMEOUT, context=self._context
+            )
+        return conn
+
+    def request(self, method: str, url: str, body: str = "", depth: str = "0") -> tuple[int, bytes]:
+        host, path = split_url(url)
+        headers = dict(self.headers, Depth=depth)
+        payload = body.encode("utf-8") if body else None
+        for attempt in (1, 2):
+            conn = self._connection(host)
+            try:
+                conn.request(method, path, body=payload, headers=headers)
+                resp = conn.getresponse()
+                data = resp.read(MAX_RESPONSE_BYTES)
+                return resp.status, data
+            except (http.client.HTTPException, OSError):
+                # A pooled connection the server already closed fails on first
+                # use; drop it and retry once on a fresh one.
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                self._local.pool.pop(host, None)
+                if attempt == 2:
+                    raise
+        raise Failure("transport", "unreachable")
+
+    def close(self) -> None:
+        for conn in getattr(self._local, "pool", {}).values():
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+def split_url(url: str) -> tuple[str, str]:
+    rest = url.split("://", 1)[1]
+    host, _, path = rest.partition("/")
+    return host, "/" + path
+
+
+def absolute(base: str, href: str) -> str:
+    if href.startswith("http"):
+        return href
+    host, _ = split_url(base)
+    return f"https://{host}{href}"
+
+
+def text_of(node, path: str) -> str:
+    found = node.find(path, NS)
+    return (found.text or "").strip() if found is not None else ""
+
+
+# ------------------------------------------------------------------ discovery
+
+
+def discover(session: DavSession, server: str = ICLOUD) -> dict:
+    """current-user-principal -> calendar-home-set -> the calendars."""
+    status, body = session.request(
+        "PROPFIND", server,
+        '<?xml version="1.0"?><d:propfind xmlns:d="DAV:">'
+        "<d:prop><d:current-user-principal/></d:prop></d:propfind>",
+    )
+    # iCloud answers a wrong password with 403 at the principal lookup, not
+    # 401, so both mean the same thing to whoever is filling in the form.
+    if status in (401, 403):
+        raise Failure("auth",
+                      "the server rejected that account and password — "
+                      "iCloud needs an app-specific password, not your Apple ID password")
+    if status not in (200, 207):
+        raise Failure("discovery", f"principal lookup returned HTTP {status}")
+
+    principal = text_of(ET.fromstring(body), ".//d:current-user-principal/d:href")
+    if not principal:
+        raise Failure("discovery", "server returned no principal")
+    principal_url = absolute(server, principal)
+
+    _, body = session.request(
+        "PROPFIND", principal_url,
+        '<?xml version="1.0"?><d:propfind xmlns:d="DAV:" '
+        'xmlns:c="urn:ietf:params:xml:ns:caldav">'
+        "<d:prop><c:calendar-home-set/></d:prop></d:propfind>",
+    )
+    home = text_of(ET.fromstring(body), ".//c:calendar-home-set/d:href")
+    if not home:
+        raise Failure("discovery", "server returned no calendar-home-set")
+    home_url = absolute(principal_url, home)
+
+    _, body = session.request(
+        "PROPFIND", home_url,
+        '<?xml version="1.0"?><d:propfind xmlns:d="DAV:" '
+        'xmlns:c="urn:ietf:params:xml:ns:caldav" '
+        'xmlns:cs="http://calendarserver.org/ns/" '
+        'xmlns:a="http://apple.com/ns/ical/"><d:prop>'
+        "<d:resourcetype/><d:displayname/><cs:getctag/><d:current-user-privilege-set/>"
+        "<c:supported-calendar-component-set/><a:calendar-color/>"
+        "</d:prop></d:propfind>",
+        depth="1",
+    )
+
+    calendars = []
+    for resp in ET.fromstring(body).findall("d:response", NS):
+        href = text_of(resp, "d:href")
+        kinds = {
+            child.tag.split("}")[-1]
+            for node in resp.findall(".//d:resourcetype", NS)
+            for child in node
+        }
+        # The home collection and the scheduling inbox/outbox answer here too;
+        # only a real <calendar/> holding VEVENTs is ours. VTODO-only
+        # collections are Apple Reminders lists, not calendars.
+        if "calendar" not in kinds or kinds & {"schedule-inbox", "schedule-outbox"}:
+            continue
+        comps = [
+            c.get("name")
+            for c in resp.findall(".//c:supported-calendar-component-set/c:comp", NS)
+        ]
+        if "VEVENT" not in comps:
+            continue
+        privileges = {
+            child.tag.split("}")[-1]
+            for node in resp.findall(".//d:current-user-privilege-set", NS)
+            for priv in node
+            for child in priv
+        }
+        calendars.append({
+            "href": href,
+            "url": absolute(home_url, href),
+            "name": text_of(resp, ".//d:displayname") or href.rstrip("/").rsplit("/", 1)[-1],
+            "color": (text_of(resp, ".//a:calendar-color") or "")[:7],
+            "ctag": text_of(resp, ".//cs:getctag"),
+            "readonly": bool(privileges) and "write-content" not in privileges,
+        })
+    return {"principal": principal_url, "home": home_url, "calendars": calendars}
+
+
+# ---------------------------------------------------------------------- cache
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS accounts (
+    user   TEXT PRIMARY KEY,
+    server TEXT NOT NULL,
+    home   TEXT NOT NULL DEFAULT '',
+    added  INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS calendars (
+    url       TEXT PRIMARY KEY,
+    href      TEXT NOT NULL DEFAULT '',
+    name      TEXT NOT NULL DEFAULT '',
+    color     TEXT NOT NULL DEFAULT '',
+    ctag      TEXT NOT NULL DEFAULT '',
+    token     TEXT NOT NULL DEFAULT '',
+    account   TEXT NOT NULL DEFAULT '',
+    readonly  INTEGER NOT NULL DEFAULT 0,
+    enabled   INTEGER NOT NULL DEFAULT 1,
+    synced_at INTEGER NOT NULL DEFAULT 0,
+    error     TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS objects (
+    url         TEXT PRIMARY KEY,
+    calendar    TEXT NOT NULL,
+    etag        TEXT NOT NULL DEFAULT '',
+    ics         TEXT NOT NULL,
+    -- Span bounds so a window query can discard objects without parsing them.
+    -- open_ended marks a recurrence with no UNTIL/COUNT, which has no
+    -- computable last occurrence and must always be expanded.
+    first_start INTEGER NOT NULL DEFAULT 0,
+    last_end    INTEGER NOT NULL DEFAULT 0,
+    open_ended  INTEGER NOT NULL DEFAULT 1,
+    summary     TEXT NOT NULL DEFAULT '',
+    uid         TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS objects_calendar ON objects(calendar);
+CREATE INDEX IF NOT EXISTS objects_span ON objects(open_ended, last_end, first_start);
+CREATE INDEX IF NOT EXISTS objects_uid ON objects(uid);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"""
+
+
+def migrate(conn) -> None:
+    """Carry a one-account database into the many-account shape.
+
+    The old table held a single row under a CHECK (id = 1); its account moves
+    across and every calendar already stored is attributed to it, since there
+    was nothing else it could have belonged to.
+    """
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if "account" not in tables:
+        return
+    row = conn.execute("SELECT user, server, home FROM account WHERE id=1").fetchone()
+    if row:
+        conn.execute(
+            "INSERT INTO accounts(user,server,home,added) VALUES(?,?,?,?) "
+            "ON CONFLICT(user) DO NOTHING",
+            (row[0], row[1], row[2], int(time.time())),
+        )
+        conn.execute("UPDATE calendars SET account=? WHERE account=''", (row[0],))
+    conn.execute("DROP TABLE account")
+    conn.commit()
+
+
+def db() -> sqlite3.Connection:
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.executescript(SCHEMA)
+    # A column added after the fact; sqlite has no IF NOT EXISTS for one.
+    have = {r[1] for r in conn.execute("PRAGMA table_info(calendars)")}
+    if "account" not in have:
+        conn.execute("ALTER TABLE calendars ADD COLUMN account TEXT NOT NULL DEFAULT ''")
+    migrate(conn)
+    return conn
+
+
+def accounts_of(conn) -> list[tuple[str, str]]:
+    rows = list(conn.execute("SELECT user, server FROM accounts ORDER BY added, user"))
+    if not rows:
+        raise Failure("no-account", "no account configured; run login first")
+    return [(r[0], r[1]) for r in rows]
+
+
+# sqlite does not hand back the pages a delete frees until it is told to.
+# Called after a removal, which is the only time the cache genuinely shrinks.
+def reclaim(conn) -> None:
+    try:
+        conn.execute("VACUUM")
+    except sqlite3.Error:
+        pass
+
+
+def read_settings(conn) -> dict:
+    values = dict(DEFAULT_SETTINGS)
+    for key, value in conn.execute("SELECT key, value FROM settings"):
+        try:
+            values[key] = json.loads(value)
+        except json.JSONDecodeError:
+            values[key] = value
+    return values
+
+
+# ----------------------------------------------------------------------- sync
+
+
+def sync_report(token: str) -> str:
+    # No <d:limit> and no <c:calendar-data>: iCloud ignores both here and
+    # answers with etags only, so bodies come from calendar-multiget.
+    since = f"<d:sync-token>{token}</d:sync-token>" if token else "<d:sync-token/>"
+    return (
+        '<?xml version="1.0"?><d:sync-collection xmlns:d="DAV:">'
+        f"{since}<d:sync-level>1</d:sync-level>"
+        "<d:prop><d:getetag/></d:prop></d:sync-collection>"
+    )
+
+
+def multiget_body(hrefs: list[str]) -> str:
+    return (
+        '<?xml version="1.0"?><c:calendar-multiget xmlns:d="DAV:" '
+        'xmlns:c="urn:ietf:params:xml:ns:caldav">'
+        "<d:prop><d:getetag/><c:calendar-data/></d:prop>"
+        + "".join(f"<d:href>{h}</d:href>" for h in hrefs)
+        + "</c:calendar-multiget>"
+    )
+
+
+def fetch_calendar(session: DavSession, cal: dict, known: dict[str, str],
+                   pool: ThreadPoolExecutor, force: bool) -> dict:
+    """Network half of a sync. Returns rows to write; touches no database."""
+    started = time.monotonic()
+
+    # ctag short-circuits the whole calendar: unchanged means not even the
+    # etag REPORT is worth sending.
+    if not force and cal["ctag"] and cal["ctag"] == cal.get("cached_ctag"):
+        return {"url": cal["url"], "ok": True, "skipped": True,
+                "added": 0, "changed": 0, "removed": 0,
+                "elapsed": round(time.monotonic() - started, 2)}
+
+    token = "" if force else cal.get("cached_token", "")
+    status, body = session.request("REPORT", cal["url"], sync_report(token), depth="1")
+    if status in (403, 409) and token:
+        # Stale or unsupported sync-token: start over.
+        token = ""
+        status, body = session.request("REPORT", cal["url"], sync_report(""), depth="1")
+    if status not in (200, 207):
+        return {"url": cal["url"], "ok": False, "error": f"HTTP {status}",
+                "elapsed": round(time.monotonic() - started, 2)}
+
+    root = ET.fromstring(body)
+    stale: list[str] = []
+    removed: list[str] = []
+    for resp in root.findall("d:response", NS):
+        href = text_of(resp, "d:href")
+        if not href or href.rstrip("/") == cal["href"].rstrip("/"):
+            continue
+        url = absolute(cal["url"], href)
+        if "404" in text_of(resp, "d:status"):
+            removed.append(url)
+            continue
+        # Only pull bodies whose etag moved: what makes a warm sync cheap.
+        # --force ignores the etags so a changed parser can rebuild the index.
+        if force or known.get(url) != text_of(resp, ".//d:getetag"):
+            stale.append(href)
+
+    batches = [stale[i:i + MULTIGET_BATCH] for i in range(0, len(stale), MULTIGET_BATCH)]
+
+    def fetch(batch: list[str]) -> list[tuple]:
+        status, payload = session.request(
+            "REPORT", cal["url"], multiget_body(batch), depth="1"
+        )
+        if status not in (200, 207):
+            return []
+        rows = []
+        for resp in ET.fromstring(payload).findall("d:response", NS):
+            href = text_of(resp, "d:href")
+            data = text_of(resp, ".//c:calendar-data")
+            if not href or not data:
+                continue
+            url = absolute(cal["url"], href)
+            first, last, open_ended, summary, uid = index_of(data)
+            rows.append((url, cal["url"], text_of(resp, ".//d:getetag"), data,
+                         first, last, open_ended, summary, uid))
+        return rows
+
+    rows: list[tuple] = []
+    for chunk in pool.map(fetch, batches):
+        rows.extend(chunk)
+
+    added = sum(1 for row in rows if row[0] not in known)
+    return {
+        "url": cal["url"], "ok": True, "skipped": False,
+        "rows": rows, "removed": removed, "token": text_of(root, "d:sync-token"),
+        "added": added, "changed": len(rows) - added, "removedCount": len(removed),
+        "elapsed": round(time.monotonic() - started, 2),
+    }
+
+
+def sync(conn, only: str = "", force: bool = False) -> dict:
+    started = time.monotonic()
+    results = []
+
+    # Each account is discovered and pulled on its own, so one that is down
+    # or whose password was revoked does not stop the others.
+    for user, server in accounts_of(conn):
+        try:
+            results.extend(sync_account(conn, user, server, only, force))
+        except Failure as failure:
+            results.append({"account": user, "ok": False, "error": failure.message})
+        except Exception as error:
+            results.append({"account": user, "ok": False, "error": str(error)[:200]})
+
+    conn.commit()
+    return {
+        "ok": True,
+        "calendars": [
+            {k: v for k, v in outcome.items() if k not in ("rows", "removed")}
+            for outcome in results
+        ],
+        "elapsed": round(time.monotonic() - started, 2),
+    }
+
+
+def sync_account(conn, user: str, server: str, only: str, force: bool) -> list[dict]:
+    session = DavSession(user, load_password(user))
+    found = discover(session, server)
+    cached = {
+        row[0]: {"ctag": row[1], "token": row[2], "enabled": row[3]}
+        for row in conn.execute("SELECT url, ctag, token, enabled FROM calendars")
+    }
+
+    targets = []
+    for cal in found["calendars"]:
+        if only and only not in (cal["href"], cal["url"], cal["name"]):
+            continue
+        state = cached.get(cal["url"], {})
+        if state.get("enabled", 1) == 0:
+            continue
+        cal["cached_ctag"] = state.get("ctag", "")
+        cal["cached_token"] = state.get("token", "")
+        targets.append(cal)
+
+    known_by_calendar: dict[str, dict[str, str]] = {c["url"]: {} for c in targets}
+    for url, calendar, etag in conn.execute("SELECT url, calendar, etag FROM objects"):
+        if calendar in known_by_calendar:
+            known_by_calendar[calendar][url] = etag
+
+    # Calendars run in parallel and so do the multiget batches inside each, all
+    # sharing one pool so the total request concurrency stays bounded.
+    results = []
+    with ThreadPoolExecutor(max_workers=SYNC_WORKERS) as pool:
+        futures = [
+            pool.submit(fetch_calendar, session, cal, known_by_calendar[cal["url"]], pool, force)
+            for cal in targets
+        ]
+        for cal, future in zip(targets, futures):
+            try:
+                outcome = future.result()
+            except Exception as error:  # network, XML, anything per-calendar
+                outcome = {"url": cal["url"], "ok": False, "error": str(error)[:200]}
+            outcome["name"] = cal["name"]
+            outcome["account"] = user
+            results.append((cal, outcome))
+
+    # All writes happen here, on one thread, in one transaction per calendar.
+    now = int(time.time())
+    for cal, outcome in results:
+        conn.execute(
+            "INSERT INTO calendars(url,href,name,color,ctag,token,account,readonly,"
+            "synced_at,error) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(url) DO UPDATE SET "
+            "href=excluded.href, name=excluded.name, color=excluded.color, "
+            "account=excluded.account, readonly=excluded.readonly, "
+            "synced_at=excluded.synced_at, error=excluded.error",
+            (cal["url"], cal["href"], cal["name"], cal["color"], cal["ctag"],
+             "", user, int(cal["readonly"]), now, outcome.get("error", "")),
+        )
+        if not outcome.get("ok") or outcome.get("skipped"):
+            continue
+        if outcome["removed"]:
+            conn.executemany(
+                "DELETE FROM objects WHERE url=?", [(u,) for u in outcome["removed"]]
+            )
+        if outcome["rows"]:
+            conn.executemany(
+                "INSERT INTO objects(url,calendar,etag,ics,first_start,last_end,"
+                "open_ended,summary,uid) VALUES(?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(url) DO UPDATE SET etag=excluded.etag, ics=excluded.ics, "
+                "first_start=excluded.first_start, last_end=excluded.last_end, "
+                "open_ended=excluded.open_ended, summary=excluded.summary, uid=excluded.uid",
+                outcome["rows"],
+            )
+        conn.execute(
+            "UPDATE calendars SET ctag=?, token=? WHERE url=?",
+            (cal["ctag"], outcome["token"], cal["url"]),
+        )
+    session.close()
+    return [outcome for _, outcome in results]
+
+
+# --------------------------------------------------------------- ical helpers
+
+
+def local_iso(seconds: int) -> str:
+    return datetime.fromtimestamp(seconds, LOCAL_TZ).isoformat()
+
+
+def floating_date(seconds: int) -> str:
+    """The calendar date of an all-day event.
+
+    An all-day event is a date, not an instant: a birthday on the 22nd is the
+    22nd in every zone. libical reports its span at midnight UTC, so the date
+    is read back in UTC and emitted bare. Converting it to local time is the
+    classic off-by-one that lands it on the previous day west of UTC.
+    """
+    return datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%d")
+
+
+def property_text(comp, kind) -> str:
+    prop = comp.get_first_property(kind)
+    return (prop.get_value_as_string() or "") if prop is not None else ""
+
+
+def parse_ics(ics: str):
+    try:
+        parsed = ICal.Component.new_from_string(ics)
+    except Exception:
+        return None
+    return parsed
+
+
+def timezone_named(parsed, name: str):
+    """Build an ICal.Timezone from the VTIMEZONE the object carries for `name`."""
+    comp = parsed.get_first_component(ICal.ComponentKind.VTIMEZONE_COMPONENT)
+    while comp is not None:
+        if property_text(comp, ICal.PropertyKind.TZID_PROPERTY) == name:
+            zone = ICal.Timezone.new()
+            zone.set_component(comp.clone())
+            return zone
+        comp = parsed.get_next_component(ICal.ComponentKind.VTIMEZONE_COMPONENT)
+    try:
+        return ICal.Timezone.get_builtin_timezone(name)
+    except Exception:
+        return None
+
+
+def absolute_time(parsed, moment) -> int | None:
+    """Resolve an ICal.Time to a real instant.
+
+    `as_timet()` and `get_span()` ignore TZID and read a zoned time as if it
+    were UTC — 13:00 America/Chicago comes back as 13:00Z, five hours early.
+    The zone has to be rebuilt from the VTIMEZONE the object carries and
+    applied explicitly. (foreach_recurrence does resolve this correctly, which
+    is why expanded occurrences were right while spans were not.)
+    """
+    if moment is None or moment.is_null_time():
+        return None
+    if moment.is_date() or moment.is_utc():
+        return moment.as_timet()
+    zone = moment.get_timezone()
+    name = zone.get_location() if zone is not None else ""
+    if name:
+        resolved = timezone_named(parsed, name)
+        if resolved is not None:
+            return moment.as_timet_with_zone(resolved)
+    return moment.as_timet()
+
+
+def span_of(parsed, comp) -> tuple[int, int]:
+    """(start, end) of one component as real instants, TZID respected."""
+    begin = absolute_time(parsed, comp.get_dtstart())
+    finish = absolute_time(parsed, comp.get_dtend())
+    if begin is None:
+        span = comp.get_span()
+        return span.get_start(), span.get_end()
+    if finish is None:
+        # DURATION instead of DTEND, or a zero-length event.
+        raw = comp.get_span()
+        length = max(0, raw.get_end() - raw.get_start())
+        finish = begin + length
+    return begin, finish
+
+
+def vevents(parsed) -> list:
+    out = []
+    comp = parsed.get_first_component(ICal.ComponentKind.VEVENT_COMPONENT)
+    while comp is not None:
+        out.append(comp)
+        comp = parsed.get_next_component(ICal.ComponentKind.VEVENT_COMPONENT)
+    return out
+
+
+def split_master_overrides(parsed, comps: list) -> tuple[object | None, dict[int, object]]:
+    """A recurring event with edited occurrences stores the master and each
+    override in the same object; the override carries RECURRENCE-ID naming the
+    slot it replaces. Expanding both without this produces duplicates.
+
+    The key must be resolved through absolute_time for the same reason spans
+    are: a RECURRENCE-ID with a TZID read raw lands hours off the occurrence
+    it is meant to suppress, and the suppression silently misses.
+    """
+    master = None
+    overrides: dict[int, object] = {}
+    for comp in comps:
+        rid = comp.get_recurrenceid()
+        if rid is not None and not rid.is_null_time():
+            at = absolute_time(parsed, rid)
+            if at is not None:
+                overrides[at] = comp
+        elif master is None:
+            master = comp
+    return master, overrides
+
+
+def index_of(ics: str) -> tuple[int, int, int, str, str]:
+    """(first_start, last_end, open_ended, summary, uid), computed at sync time
+    so window queries can discard objects in SQL before parsing them."""
+    parsed = parse_ics(ics)
+    if parsed is None:
+        return (0, 0, 1, "", "")
+    comps = vevents(parsed)
+    if not comps:
+        return (0, 0, 1, "", "")
+
+    first = last = None
+    open_ended = 0
+    for comp in comps:
+        begin, finish = span_of(parsed, comp)
+        first = begin if first is None else min(first, begin)
+        last = finish if last is None else max(last, finish)
+
+        rrule = comp.get_first_property(ICal.PropertyKind.RRULE_PROPERTY)
+        if rrule is not None:
+            text = rrule.as_ical_string() or ""
+            if "UNTIL" in text or "COUNT" in text:
+                recur = rrule.get_rrule()
+                iterator = ICal.RecurIterator.new(recur, comp.get_dtstart())
+                duration = finish - begin
+                for _ in range(MAX_EXPAND):
+                    occurrence = iterator.next()
+                    if occurrence is None or occurrence.is_null_time():
+                        break
+                    last = max(last, occurrence.as_timet() + duration)
+                else:
+                    open_ended = 1
+            else:
+                open_ended = 1
+        if comp.get_first_property(ICal.PropertyKind.RDATE_PROPERTY) is not None:
+            open_ended = 1
+
+    head = comps[0]
+    return (int(first or 0), int(last or 0), open_ended,
+            head.get_summary() or "", head.get_uid() or "")
+
+
+def meeting_link(*fields: str) -> tuple[str, str]:
+    for text in fields:
+        if not text:
+            continue
+        for kind, pattern in MEETING_PATTERNS:
+            found = pattern.search(text)
+            if found:
+                return found.group(0).rstrip(".,>)"), kind
+    return "", ""
+
+
+def base_fields(comp, cal: dict) -> dict:
+    description = property_text(comp, ICal.PropertyKind.DESCRIPTION_PROPERTY)
+    location = comp.get_location() or ""
+    url = property_text(comp, ICal.PropertyKind.URL_PROPERTY)
+    link, kind = meeting_link(url, location, description)
+    return {
+        "uid": comp.get_uid() or "",
+        "title": comp.get_summary() or "",
+        "location": location,
+        "calendar": cal.get("name", ""),
+        "calendarUrl": cal.get("url", ""),
+        "color": cal.get("color", ""),
+        "meetingUrl": link,
+        "meetingKind": kind,
+    }
+
+
+def occurrence(comp, cal: dict, begin: int, finish: int, all_day: bool,
+               rid: str = "") -> dict:
+    # DTEND is exclusive in iCalendar and stays exclusive here: a one-day
+    # all-day event is start 09-22, end 09-23.
+    when = (
+        {"start": floating_date(begin), "end": floating_date(finish)}
+        if all_day
+        else {"start": local_iso(begin), "end": local_iso(finish)}
+    )
+    return {**base_fields(comp, cal), "allDay": all_day, "rid": rid, **when}
+
+
+def expand(ics: str, cal: dict, start: datetime, end: datetime, out: list) -> None:
+    """Expand one calendar object into the occurrences inside [start, end)."""
+    parsed = parse_ics(ics)
+    if parsed is None:
+        return
+    master, overrides = split_master_overrides(parsed, vevents(parsed))
+    win_start = ICal.Time.new_from_string(
+        start.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    )
+    win_end = ICal.Time.new_from_string(
+        end.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    )
+
+    if master is not None:
+        all_day = master.get_dtstart().is_date()
+
+        def collect(_comp, span, _data):
+            begin = span.get_start()
+            # The override replaces this slot and is emitted below.
+            if begin in overrides:
+                return True
+            out.append(occurrence(master, cal, begin, span.get_end(), all_day))
+            return True
+
+        try:
+            master.foreach_recurrence(win_start, win_end, collect, None)
+        except Exception:
+            pass
+
+    lower, upper = int(start.timestamp()), int(end.timestamp())
+    for rid_at, comp in overrides.items():
+        begin, finish = span_of(parsed, comp)
+        if finish < lower or begin >= upper:
+            continue
+        rid = comp.get_recurrenceid()
+        out.append(occurrence(
+            comp, cal, begin, finish, comp.get_dtstart().is_date(),
+            rid=rid.as_ical_string() if rid is not None else str(rid_at),
+        ))
+
+
+SEARCH_HORIZON_DAYS = 400
+
+
+def next_occurrence(parsed, comp) -> tuple[int, int]:
+    """The soonest occurrence from today, else the event's own span.
+
+    A yearly birthday's DTSTART is the year it was created, so a search hit
+    reported at its span would read 2018 for an event that next happens next
+    month. Recurring matches are projected forward instead.
+    """
+    begin, finish = span_of(parsed, comp)
+    if comp.get_first_property(ICal.PropertyKind.RRULE_PROPERTY) is None:
+        return begin, finish
+
+    now = datetime.now(LOCAL_TZ)
+    horizon = now + timedelta(days=SEARCH_HORIZON_DAYS)
+    found: list[tuple[int, int]] = []
+
+    def collect(_comp, span, _data):
+        found.append((span.get_start(), span.get_end()))
+        return False  # the first hit is the one we want
+
+    try:
+        comp.foreach_recurrence(
+            ICal.Time.new_from_string(now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")),
+            ICal.Time.new_from_string(horizon.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")),
+            collect, None,
+        )
+    except Exception:
+        pass
+    return found[0] if found else (begin, finish)
+
+
+def visible_calendars(conn) -> dict[str, dict]:
+    return {
+        row[0]: {"url": row[0], "name": row[1], "color": row[2], "readonly": bool(row[3])}
+        for row in conn.execute(
+            "SELECT url, name, color, readonly FROM calendars WHERE enabled=1"
+        )
+    }
+
+
+def window_rows(conn, start: datetime, end: datetime, calendars: list[str]):
+    sql = (
+        "SELECT calendar, ics FROM objects "
+        "WHERE (open_ended=1 OR (last_end >= ? AND first_start < ?))"
+    )
+    args: list = [int(start.timestamp()), int(end.timestamp())]
+    if calendars:
+        sql += f" AND calendar IN ({','.join('?' * len(calendars))})"
+        args += calendars
+    return conn.execute(sql, args)
+
+
+def events(conn, start: datetime, end: datetime, only: list[str]) -> dict:
+    started = time.monotonic()
+    cals = visible_calendars(conn)
+    wanted = [url for url in cals if not only or cals[url]["name"] in only or url in only]
+    total = conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
+    # Nothing selected means nothing to draw. Without this the empty list falls
+    # through to "no filter" below and every calendar comes back, so hiding
+    # them all looked identical to showing them all.
+    if not wanted:
+        return {
+            "ok": True, "events": [], "parsed": 0, "objects": total,
+            "range": {"start": start.isoformat(), "end": end.isoformat()},
+            "elapsed": round(time.monotonic() - started, 2),
+        }
+    out: list = []
+    parsed = 0
+    for calendar, ics in window_rows(conn, start, end, wanted):
+        expand(ics, cals.get(calendar, {}), start, end, out)
+        parsed += 1
+    # By day, all-day first (they head the band in every view), then by time.
+    out.sort(key=lambda e: (e["start"][:10], not e["allDay"], e["start"]))
+    return {
+        "ok": True, "events": out, "parsed": parsed,
+        "objects": conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0],
+        "range": {"start": start.isoformat(), "end": end.isoformat()},
+        "elapsed": round(time.monotonic() - started, 2),
+    }
+
+
+def event_detail(conn, uid: str, rid: str) -> dict:
+    cals = visible_calendars(conn)
+    row = conn.execute(
+        "SELECT calendar, ics, url, etag FROM objects WHERE uid=? LIMIT 1", (uid,)
+    ).fetchone()
+    if not row:
+        raise Failure("not-found", f"no event with uid {uid}")
+    calendar, ics, url, etag = row
+    parsed = parse_ics(ics)
+    if parsed is None:
+        raise Failure("parse", "could not parse the stored event")
+
+    comps = vevents(parsed)
+    master, overrides = split_master_overrides(parsed, comps)
+    chosen = master
+    if rid:
+        for at, comp in overrides.items():
+            recurrence_id = comp.get_recurrenceid()
+            if rid in (str(at), recurrence_id.as_ical_string() if recurrence_id else ""):
+                chosen = comp
+                break
+    if chosen is None:
+        chosen = comps[0]
+
+    cal = cals.get(calendar, {})
+    begin, finish = span_of(parsed, chosen)
+    all_day = chosen.get_dtstart().is_date()
+    detail = occurrence(chosen, cal, begin, finish, all_day, rid)
+
+    attendees = []
+    prop = chosen.get_first_property(ICal.PropertyKind.ATTENDEE_PROPERTY)
+    while prop is not None:
+        attendees.append((prop.get_value_as_string() or "").replace("mailto:", ""))
+        prop = chosen.get_next_property(ICal.PropertyKind.ATTENDEE_PROPERTY)
+
+    alarms = []
+    alarm = chosen.get_first_component(ICal.ComponentKind.VALARM_COMPONENT)
+    while alarm is not None:
+        alarms.append(property_text(alarm, ICal.PropertyKind.TRIGGER_PROPERTY))
+        alarm = chosen.get_next_component(ICal.ComponentKind.VALARM_COMPONENT)
+
+    rrule = chosen.get_first_property(ICal.PropertyKind.RRULE_PROPERTY)
+    detail.update({
+        "description": property_text(chosen, ICal.PropertyKind.DESCRIPTION_PROPERTY),
+        "url": property_text(chosen, ICal.PropertyKind.URL_PROPERTY),
+        "status": property_text(chosen, ICal.PropertyKind.STATUS_PROPERTY),
+        "organizer": property_text(chosen, ICal.PropertyKind.ORGANIZER_PROPERTY).replace("mailto:", ""),
+        "attendees": attendees,
+        "alarms": [a for a in alarms if a],
+        "rrule": (rrule.as_ical_string() or "").replace("RRULE:", "").strip() if rrule else "",
+        "recurring": rrule is not None,
+        "occurrences": len(overrides),
+        "readonly": cal.get("readonly", False),
+        "href": url,
+        "etag": etag,
+    })
+    return {"ok": True, "event": detail}
+
+
+def search(conn, query: str, limit: int) -> dict:
+    started = time.monotonic()
+    cals = visible_calendars(conn)
+    needle = f"%{query.lower()}%"
+    out = []
+    rows = conn.execute(
+        "SELECT calendar, ics FROM objects WHERE calendar IN "
+        f"({','.join('?' * len(cals)) or 'NULL'}) AND lower(summary) LIKE ? LIMIT ?",
+        [*cals.keys(), needle, limit * 4],
+    )
+    for calendar, ics in rows:
+        parsed = parse_ics(ics)
+        if parsed is None:
+            continue
+        master, _ = split_master_overrides(parsed, vevents(parsed))
+        if master is None:
+            continue
+        begin, finish = next_occurrence(parsed, master)
+        out.append(occurrence(
+            master, cals.get(calendar, {}), begin, finish,
+            master.get_dtstart().is_date(),
+        ))
+        if len(out) >= limit:
+            break
+    out.sort(key=lambda e: e["start"])
+    return {"ok": True, "events": out, "query": query,
+            "elapsed": round(time.monotonic() - started, 2)}
+
+
+def status(conn) -> dict:
+    accounts = [
+        {"user": r[0], "server": r[1], "provider": r[1]}
+        for r in conn.execute("SELECT user, server FROM accounts ORDER BY added, user")
+    ]
+    calendars = [
+        {"url": r[0], "name": r[1], "color": r[2], "enabled": bool(r[3]),
+         "readonly": bool(r[4]), "syncedAt": r[5], "error": r[6], "objects": r[7],
+         "account": r[8]}
+        for r in conn.execute(
+            "SELECT c.url, c.name, c.color, c.enabled, c.readonly, c.synced_at, c.error, "
+            "(SELECT COUNT(*) FROM objects o WHERE o.calendar = c.url), c.account "
+            "FROM calendars c ORDER BY c.account, c.name"
+        )
+    ]
+    return {
+        "ok": True,
+        "accounts": accounts,
+        # The first account, for callers that only ever expected one.
+        "account": accounts[0] if accounts else None,
+        "calendars": calendars,
+        "objects": conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0],
+        "lastSync": max([c["syncedAt"] for c in calendars], default=0),
+        "settings": read_settings(conn),
+        "cacheBytes": os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0,
+    }
+
+
+# ------------------------------------------------------------------------ cli
+
+
+def parse_when(value: str) -> datetime:
+    if len(value) == 10:
+        parsed = datetime.fromisoformat(value)
+    else:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=LOCAL_TZ)
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="omarcal-helper")
+    ap.add_argument("command", choices=[
+        "login", "reveal-password", "accounts", "remove-account",
+        "calendars", "set-calendar", "forget-calendar", "sync",
+        "events", "event", "search", "agenda", "status", "settings", "watch",
+    ])
+    ap.add_argument("--user", default=os.environ.get("OMARCAL_USER", ""))
+    ap.add_argument("--server", default=ICLOUD)
+    ap.add_argument("--calendar", default="")
+    ap.add_argument("--only", action="append", default=[])
+    ap.add_argument("--from", dest="start", default="")
+    ap.add_argument("--to", dest="end", default="")
+    ap.add_argument("--uid", default="")
+    ap.add_argument("--rid", default="")
+    ap.add_argument("--query", default="")
+    ap.add_argument("--limit", type=int, default=50)
+    ap.add_argument("--days", type=int, default=7)
+    ap.add_argument("--interval", type=int, default=0)
+    ap.add_argument("--enabled", choices=["true", "false"], default="")
+    ap.add_argument("--color", default="")
+    ap.add_argument("--name", default="")
+    ap.add_argument("--set", action="append", default=[])
+    ap.add_argument("--force", action="store_true")
+    args = ap.parse_args(argv)
+
+    conn = db()
+    try:
+        result = dispatch(conn, args)
+    except Failure as failure:
+        result = {"ok": False, "error": failure.message, "code": failure.code}
+    except Exception as error:
+        result = {"ok": False, "error": str(error)[:400], "code": "internal"}
+    conn.close()
+    print(json.dumps(result))
+    return 0
+
+
+def dispatch(conn, args) -> dict:
+    if args.command == "login":
+        if not args.user:
+            raise Failure("usage", "--user is required")
+        # One line, not to EOF. A caller that writes the password down a pipe
+        # it keeps open — which is what a QML Process does, since it has no
+        # way to close stdin — would otherwise leave this blocked forever.
+        password = os.environ.get("OMARCAL_PASSWORD") or sys.stdin.readline().strip("\r\n")
+        # No password given means "use the one already held", so an account
+        # can be re-checked or its calendars rediscovered without retyping it.
+        if not password:
+            password = stored_password(args.user)
+        if not password:
+            raise Failure("usage", "no password given and none stored")
+        session = DavSession(args.user, password)
+        found = discover(session, args.server)
+        if not os.environ.get("OMARCAL_PASSWORD"):
+            store_password(args.user, password)
+        conn.execute(
+            "INSERT INTO accounts(user,server,home,added) VALUES(?,?,?,?) "
+            "ON CONFLICT(user) DO UPDATE SET server=excluded.server, home=excluded.home",
+            (args.user, args.server, found["home"], int(time.time())),
+        )
+        for cal in found["calendars"]:
+            conn.execute(
+                "INSERT INTO calendars(url,href,name,color,account,readonly) "
+                "VALUES(?,?,?,?,?,?) ON CONFLICT(url) DO UPDATE SET "
+                "href=excluded.href, name=excluded.name, color=excluded.color, "
+                "account=excluded.account, readonly=excluded.readonly",
+                (cal["url"], cal["href"], cal["name"], cal["color"],
+                 args.user, int(cal["readonly"])),
+            )
+        conn.commit()
+        session.close()
+        return {"ok": True, "account": args.user, "calendars": found["calendars"]}
+
+    # Hands the stored password back so the panel can show it. Its own
+    # command rather than a field on `status`, so nothing reads a secret by
+    # accident.
+    if args.command == "reveal-password":
+        if not args.user:
+            raise Failure("usage", "--user is required")
+        password = stored_password(args.user)
+        if not password:
+            raise Failure("no-password", f"no stored password for {args.user}")
+        return {"ok": True, "password": password}
+
+    if args.command == "accounts":
+        return {"ok": True, "accounts": status(conn)["accounts"]}
+
+    # Everything this account brought: its calendars, their cached events, its
+    # password. Reclaims the space too — a removed account's events are the
+    # one case where the cache can honestly be made smaller.
+    if args.command == "remove-account":
+        if not args.user:
+            raise Failure("usage", "--user is required")
+        urls = [r[0] for r in conn.execute(
+            "SELECT url FROM calendars WHERE account=?", (args.user,))]
+        for url in urls:
+            conn.execute("DELETE FROM objects WHERE calendar=?", (url,))
+        conn.execute("DELETE FROM calendars WHERE account=?", (args.user,))
+        removed = conn.execute("DELETE FROM accounts WHERE user=?", (args.user,)).rowcount
+        conn.commit()
+        forget_password(args.user)
+        reclaim(conn)
+        return {"ok": True, "removed": bool(removed), "calendars": len(urls)}
+
+    # A calendar stays on the server; this stops syncing it and lets go of
+    # what was cached for it. Turning it back on syncs it again from scratch.
+    if args.command == "forget-calendar":
+        if not args.calendar:
+            raise Failure("usage", "--calendar is required")
+        row = conn.execute(
+            "SELECT url FROM calendars WHERE url=? OR name=?",
+            (args.calendar, args.calendar)).fetchone()
+        if not row:
+            raise Failure("not-found", f"no calendar matching {args.calendar}")
+        dropped = conn.execute(
+            "DELETE FROM objects WHERE calendar=?", (row[0],)).rowcount
+        conn.execute(
+            "UPDATE calendars SET enabled=0, ctag='', token='' WHERE url=?", (row[0],))
+        conn.commit()
+        reclaim(conn)
+        return {"ok": True, "forgotten": row[0], "objects": dropped}
+
+    if args.command == "calendars":
+        return {"ok": True, "calendars": status(conn)["calendars"]}
+
+    if args.command == "set-calendar":
+        if not args.calendar:
+            raise Failure("usage", "--calendar is required")
+        sets, values = [], []
+        if args.enabled:
+            sets.append("enabled=?"); values.append(int(args.enabled == "true"))
+        if args.color:
+            sets.append("color=?"); values.append(args.color)
+        if args.name:
+            sets.append("name=?"); values.append(args.name)
+        if not sets:
+            raise Failure("usage", "nothing to change")
+        values.append(args.calendar)
+        changed = conn.execute(
+            f"UPDATE calendars SET {','.join(sets)} WHERE url=? OR name=?",
+            (*values, args.calendar),
+        ).rowcount
+        conn.commit()
+        return {"ok": True, "changed": changed}
+
+    if args.command == "sync":
+        return sync(conn, args.calendar, args.force)
+
+    if args.command == "events":
+        start = parse_when(args.start) if args.start else datetime.now(LOCAL_TZ)
+        end = parse_when(args.end) if args.end else start + timedelta(days=31)
+        return events(conn, start, end, args.only)
+
+    if args.command == "event":
+        if not args.uid:
+            raise Failure("usage", "--uid is required")
+        return event_detail(conn, args.uid, args.rid)
+
+    if args.command == "search":
+        if not args.query:
+            raise Failure("usage", "--query is required")
+        return search(conn, args.query, args.limit)
+
+    if args.command == "agenda":
+        start = datetime.now(LOCAL_TZ)
+        return events(conn, start, start + timedelta(days=args.days), args.only)
+
+    if args.command == "status":
+        return status(conn)
+
+    if args.command == "settings":
+        for pair in args.set:
+            key, _, raw = pair.partition("=")
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError:
+                value = raw
+            conn.execute(
+                "INSERT INTO settings(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, json.dumps(value)),
+            )
+        conn.commit()
+        return {"ok": True, "settings": read_settings(conn)}
+
+    if args.command == "watch":
+        interval = args.interval or read_settings(conn)["refreshMinutes"] * 60
+        while True:
+            outcome = sync(conn)
+            moved = [c for c in outcome["calendars"]
+                     if c.get("added") or c.get("changed") or c.get("removedCount")]
+            print(json.dumps({"ok": True, "changed": bool(moved), "calendars": moved}),
+                  flush=True)
+            time.sleep(max(60, interval))
+
+    raise Failure("usage", f"unknown command {args.command}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
