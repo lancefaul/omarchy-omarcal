@@ -14,6 +14,47 @@ QtObject {
   id: root
 
   property string account: ""
+  // Changes saved while offline and not yet on iCloud, and those iCloud
+  // refused when they were sent — as `status` last reported them.
+  property int pendingCount: 0
+  property var pendingProblems: []
+
+  function dismissPending(id) {
+    if (dismissProc.running) return
+    dismissProc.command = [helper, "pending-dismiss", "--id", String(id)]
+    dismissProc.running = true
+  }
+
+  property Process dismissProc: Process {
+    running: false
+    stdout: StdioCollector { id: dismissOut; waitForEnd: true }
+    onExited: root.refreshStatus()
+  }
+
+  // The machine's zone, by IANA name, as the helper reads it.
+  property string localZone: ""
+
+  // Every zone, with today's offset, for the form's zone pickers. Asked for
+  // once, the first time a form wants it.
+  property var zones: []
+
+  function loadZones() {
+    if (zones.length || zonesProc.running) return
+    zonesProc.command = [helper, "zones"]
+    zonesProc.running = true
+  }
+
+  property Process zonesProc: Process {
+    running: false
+    stdout: StdioCollector { id: zonesOut; waitForEnd: true }
+    onExited: {
+      var payload = root.parse(zonesOut.text, "the time zones did not come back")
+      if (payload && payload.ok) {
+        root.zones = payload.zones || []
+        if (payload.local) root.localZone = payload.local
+      }
+    }
+  }
   property string server: ""
   property var accounts: []
   property var events: []
@@ -173,30 +214,52 @@ QtObject {
     updateFinished(outcome)
   }
 
+  // Asked through the helper, which bounds the request: a timeout on every
+  // read, a deadline on the whole, and a cap on the answer's size before any
+  // of it is buffered. The shell is long-lived; an unbounded request here
+  // could hang the check or fill its memory. The timer below is the shell's
+  // own backstop, in case the helper itself does not come back.
   function checkForUpdate() {
     if (updateChecking) return
     updateChecking = true
     updateError = ""
-    var request = new XMLHttpRequest()
-    request.open("GET", Logic.releasesApi())
-    request.setRequestHeader("Accept", "application/vnd.github+json")
-    request.setRequestHeader("User-Agent", "omarcal (" + Logic.releasesPage() + ")")
-    request.onreadystatechange = function () {
-      if (request.readyState !== XMLHttpRequest.DONE) return
+    updateProc.command = [helper, "update-check"]
+    updateProc.running = true
+    updateDeadline.restart()
+  }
+
+  property Process updateProc: Process {
+    running: false
+    stdout: StdioCollector { id: updateOut; waitForEnd: true }
+    onExited: {
+      updateDeadline.stop()
+      if (!root.updateChecking) return
       root.updateChecking = false
-      if (request.status === 200) {
-        var release = Logic.parseLatestRelease(request.responseText)
-        if (release) root.latestRelease = release
-        else root.updateError = "GitHub's answer could not be read"
-      } else if (request.status === 404) {
+      var payload = root.parse(updateOut.text, "")
+      if (!payload || !payload.ok) {
+        root.updateError = payload && payload.error ? payload.error : "GitHub could not be reached"
+      } else if (payload.status === 404) {
         // No release yet is not a failure; it is an answer.
         root.latestRelease = null
       } else {
-        root.updateError = "GitHub could not be reached"
+        var release = Logic.parseLatestRelease(payload.body)
+        if (release) root.latestRelease = release
+        else root.updateError = "GitHub's answer could not be read"
       }
       root.setSetting("updateCheckedAt", Date.now())
     }
-    request.send()
+  }
+
+  property Timer updateDeadline: Timer {
+    interval: 25000
+    repeat: false
+    onTriggered: {
+      if (!root.updateChecking) return
+      root.updateChecking = false
+      updateProc.running = false
+      root.updateError = "GitHub took too long to answer"
+      root.setSetting("updateCheckedAt", Date.now())
+    }
   }
 
   // The attempt is written before the command runs, because the command is
@@ -269,7 +332,9 @@ QtObject {
   property bool eventLoading: false
   property string eventError: ""
 
-  function loadEvent(uid, rid) {
+  // `at` is the open occurrence's start, so the helper can say what its
+  // times read in the event's own zones for that occurrence, not the first.
+  function loadEvent(uid, rid, at) {
     if (!uid) return
     // The last answer goes immediately: a viewer that opens showing the
     // previous event while this one loads is worse than one that opens empty.
@@ -277,9 +342,10 @@ QtObject {
     eventError = ""
     eventLoading = true
     detailProc.running = false
-    detailProc.command = rid
-      ? [helper, "event", "--uid", uid, "--rid", rid]
-      : [helper, "event", "--uid", uid]
+    var command = [helper, "event", "--uid", uid]
+    if (rid) command = command.concat(["--rid", rid])
+    if (at) command = command.concat(["--at", at])
+    detailProc.command = command
     detailProc.running = true
   }
 
@@ -475,8 +541,12 @@ QtObject {
       var moved = (payload.calendars || []).some(function (c) {
         return c.added || c.changed || c.removedCount
       })
-      if (moved) root.reload()
+      if (moved) { root.reload(); root.loadPlacesHistory() }
       root.refreshStatus()
+      // An address book changes slowly and has no sync token here, so it is
+      // fetched whole — once a day is plenty.
+      if (root.contactsEnabled && Date.now() - root.contactsSyncedAt > 24 * 60 * 60 * 1000)
+        root.syncContacts()
     }
   }
 
@@ -489,6 +559,9 @@ QtObject {
       root.calendars = payload.calendars || []
       root.accounts = payload.accounts || []
       root.account = payload.account ? payload.account.user : ""
+      root.localZone = payload.localZone || ""
+      root.pendingCount = payload.pending || 0
+      root.pendingProblems = payload.pendingProblems || []
       root.server = payload.account ? payload.account.server : ""
       root.settings = payload.settings || ({})
       root.cacheBytes = payload.cacheBytes || 0
@@ -540,6 +613,182 @@ QtObject {
       if (payload && payload.ok && payload.settings && !root.settingsQueue.length)
         root.settings = payload.settings
       root.runNextSetting()
+      // Contacts are read only after the yes has been written down, so the
+      // helper — which refuses while the setting is off — sees it on.
+      if (root.contactsSyncWanted && !root.settingsQueue.length && !root.settingProc.running) {
+        root.contactsSyncWanted = false
+        root.syncContacts()
+      }
+    }
+  }
+
+  // -------------------------------------------------------------- writes
+  //
+  // Saving and deleting one event. The request goes to the helper as one
+  // line of JSON on stdin — a Process cannot close its stdin, so the helper
+  // reads a line rather than to the end — and the answer is handed to
+  // whoever asked, then the window is reloaded so the change shows.
+
+  property bool writing: false
+  property string writeAction: ""
+  property var writeRequest: null
+  signal writeFinished(string action, var payload)
+
+  function saveEvent(request) { startWrite("save", request) }
+  function deleteEvent(request) { startWrite("delete", request) }
+
+  function startWrite(action, request) {
+    if (writeProc.running) return
+    writing = true
+    writeAction = action
+    writeRequest = request
+    writeProc.command = [helper, action]
+    writeProc.running = true
+  }
+
+  property Process writeProc: Process {
+    running: false
+    stdinEnabled: true
+    stdout: StdioCollector { id: writeOut; waitForEnd: true }
+    onStarted: {
+      write(JSON.stringify(root.writeRequest) + "\n")
+      root.writeRequest = null
+    }
+    onExited: {
+      var action = root.writeAction
+      root.writing = false
+      var payload = root.parse(writeOut.text, "the save did not report back")
+      // A conflict means the cache is behind iCloud; a sync brings it level
+      // so reopening the event shows what changed it.
+      if (payload && !payload.ok && payload.code === "conflict") root.sync()
+      if (payload && payload.ok) root.reload()
+      root.refreshStatus()
+      root.writeFinished(action, payload)
+    }
+  }
+
+  // -------------------------------------------------------------- places
+  //
+  // The calendar's own addresses, always, read from the cache and never
+  // sent anywhere; and a lookup service only once one has been chosen,
+  // which the helper checks for itself before it sends a thing.
+
+  readonly property string placesProvider: String(setting("placesProvider", "none"))
+  property var placesHistory: []
+  property var placeResults: []
+  property string placeResultsFor: ""
+  property bool placesSearching: false
+  property string placesError: ""
+
+  function loadPlacesHistory() {
+    if (placesHistoryProc.running) return
+    placesHistoryProc.command = [helper, "places-history"]
+    placesHistoryProc.running = true
+  }
+
+  property Process placesHistoryProc: Process {
+    running: false
+    stdout: StdioCollector { id: placesHistoryOut; waitForEnd: true }
+    onExited: {
+      var payload = root.parse(placesHistoryOut.text, "addresses did not come back")
+      if (payload && payload.ok) root.placesHistory = payload.places || []
+    }
+  }
+
+  function searchPlaces(query) {
+    var text = String(query || "").trim()
+    if (placesProvider === "none" || text.length < 3) { clearPlaces(); return }
+    placesProc.running = false
+    placeResultsFor = text
+    placesSearching = true
+    placesError = ""
+    placesProc.command = [helper, "places", "--query", text]
+    placesProc.running = true
+  }
+
+  function clearPlaces() {
+    placesProc.running = false
+    placeResults = []
+    placeResultsFor = ""
+    placesSearching = false
+    placesError = ""
+  }
+
+  function setPlacesProvider(provider) {
+    clearPlaces()
+    setSetting("placesProvider", provider)
+  }
+
+  property Process placesProc: Process {
+    running: false
+    stdout: StdioCollector { id: placesOut; waitForEnd: true }
+    onExited: {
+      root.placesSearching = false
+      var payload = root.parse(placesOut.text, "the address search did not come back")
+      if (!payload) return
+      if (!payload.ok) { root.placesError = payload.error || "the address search failed"; root.placeResults = []; return }
+      root.placeResults = payload.places || []
+    }
+  }
+
+  // ------------------------------------------------------------ contacts
+  //
+  // Opt-in. Nothing here runs until the person has said yes in the panel's
+  // own words; saying no again deletes what was kept. The helper enforces
+  // both on its side too, so this is not the only thing standing between a
+  // setting and an address book.
+
+  readonly property bool contactsEnabled: setting("contactsEnabled", false) === true
+  property var contacts: []
+  property int contactCount: 0
+  property string contactsError: ""
+  property bool contactsSyncing: false
+  property double contactsSyncedAt: 0
+  property bool contactsSyncWanted: false
+
+  function enableContacts() {
+    contactsSyncWanted = true
+    setSetting("contactsEnabled", true)
+  }
+
+  function disableContacts() {
+    contactsSyncWanted = false
+    contactsProc.running = false
+    contacts = []
+    contactCount = 0
+    contactsError = ""
+    setSetting("contactsEnabled", false)
+  }
+
+  function syncContacts() {
+    if (!contactsEnabled || contactsProc.running) return
+    contactsSyncing = true
+    contactsProc.command = [helper, "contacts-sync"]
+    contactsProc.running = true
+  }
+
+  // What is already kept, without going to iCloud for it.
+  function loadContacts() {
+    if (!contactsEnabled || contactsProc.running) return
+    contactsProc.command = [helper, "contacts"]
+    contactsProc.running = true
+  }
+
+  property Process contactsProc: Process {
+    running: false
+    stdout: StdioCollector { id: contactsOut; waitForEnd: true }
+    onExited: {
+      var syncing = root.contactsSyncing
+      root.contactsSyncing = false
+      var payload = root.parse(contactsOut.text, "contacts did not come back")
+      if (!payload) return
+      if (!payload.ok) { root.contactsError = payload.error || "contacts could not be read"; return }
+      // Switched off while this was running: what came back is not wanted.
+      if (!root.contactsEnabled) { root.contacts = []; root.contactCount = 0; return }
+      root.contacts = payload.contacts || []
+      root.contactCount = payload.count || 0
+      root.contactsError = payload.error || ""
+      if (syncing) root.contactsSyncedAt = Date.now()
     }
   }
 
@@ -574,6 +823,7 @@ QtObject {
     repeat: false
     onTriggered: {
       root.sync()
+      root.loadPlacesHistory()
       if (Logic.updateCheckDue(root.updateCheckedAt, Date.now(), root.updateCheck))
         root.checkForUpdate()
     }

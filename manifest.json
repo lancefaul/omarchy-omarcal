@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "lancefaul.omarcal",
   "name": "omarcal",
-  "version": "1.0.1",
+  "version": "2.0.0",
   "author": "lancefaul",
   "license": "MIT",
-  "description": "Your iCloud calendar in the bar: month, week and day views, an event viewer and search. Read-only for now \u2014 editing and more providers are coming.",
+  "description": "Your iCloud calendar in the bar: month, week and day views, search, and full editing \u2014 repeating events, invitees, attachments, time zones, alerts and travel time, even offline.",
   "kinds": [
     "service",
     "bar-widget"
@@ -30,6 +30,9 @@
       "wrapEvents": false,
       "dayStartHour": 0,
       "dayEndHour": 24,
+      "contactsEnabled": false,
+      "placesProvider": "none",
+      "defaultCalendar": "",
       "updateCheck": true,
       "updateDismissed": "",
       "updateCheckedAt": 0,

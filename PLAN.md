@@ -427,11 +427,56 @@ Notes from wiring it up, all of which cost a shell restart to find:
   temporary-IPC-rect method used for omedia's preview.
 
 ### Later — writes (a second release)
-- [ ] Create / edit / delete via PUT and DELETE with `If-Match`
-- [ ] **Recurring edits**: single occurrence via `RECURRENCE-ID`, versus
+- [x] Create / edit / delete via PUT and DELETE with `If-Match` (built
+      2026-09-21; planned offline in tests/helper/test_writes.py and dry-run
+      against real cached events, not yet written to iCloud for real)
+- [x] **Recurring edits**: single occurrence via `RECURRENCE-ID`, versus
       `THISANDFUTURE`. This is where CalDAV clients are usually wrong and it
       deserves its own test suite.
-- [ ] Conflict handling on 412
+- [x] Conflict handling on 412 — the form stays open and says the event
+      changed elsewhere; a sync follows so reopening shows the latest.
+- libical discards parameters it does not know unless told otherwise; the
+  helper sets ASSUME_IANA_TOKEN, or a save strips Apple's ROUTING=CAR. It
+  also replaces an empty property with an X-LIC-ERROR line, which `clean()`
+  removes before anything is sent.
+- [x] Attachments: upload with `POST <event>?action=attachment-add` (RFC 8607).
+      **iCloud quirks, found live 2026-09-21:** attachment-add rewrites the
+      event and drops its VALARMs and X-APPLE-TRAVEL-DURATION, so the helper
+      reads it back and re-PUTs its own version with iCloud's ATTACH lines;
+      attachment-remove answers 200 and removes nothing, so removal is a PUT
+      without the ATTACH line, which iCloud honours.
+      **Probed 2026-09-21:** iCloud advertises `calendar-managed-attachments`
+      and `calendar-auto-schedule` (it sends invitations itself). A text file
+      added this way to a test event showed and opened on the user's iPhone.
+      iCloud publishes no `max-attachment-size` or per-event limit.
+      **Limits as Apple states them** (given by the user 2026-09-21, not
+      confirmed against the server): 20 attachments per event, 20 MB in
+      total per event, 1 GB for all calendar and reminder data, and no
+      `\ / : * ? " < > |` in a filename. The form enforces the first, second
+      and fourth (20 MB read as 20,000,000 bytes). Confirm with an upload test
+      in the write-path work.
+- [ ] CONFERENCE (RFC 7986) for video calls: written by the form, but whether
+      the iPhone shows it is unverified until the first real save.
+- [ ] Structured location: a picked address carries its point, to be written
+      as `X-APPLE-STRUCTURED-LOCATION` (geo: URI, X-TITLE, X-ADDRESS) the way
+      Apple writes it. Whether the iPhone then shows the map and works out
+      travel time from it is unverified until the first real save.
+- Default calendar (2026-09-21): iCloud does not publish RFC 6638
+  `schedule-default-calendar-URL` (probed: the inbox answers without it), so
+  a new event goes to the calendar chosen in Settings → NEW EVENTS, or the
+  busiest writable calendar of the first account. A provider that does
+  publish one (Fastmail, and most RFC 6638 servers) should be read at
+  discovery and preferred over that guess.
+- Moving an event to a calendar in another account is a create there and a
+  delete here, not a MOVE: invitees are re-invited from the new organiser
+  and managed attachments stay behind. The form says so; the write path
+  must do it that way.
+- Address lookups (2026-09-21): the calendar's own history is always
+  suggested, offline. Photon (komoot) and Nominatim (OSM Foundation) are
+  opt-in behind a consent dialog; Nominatim searches on a button only, at
+  most once a second, because its usage policy forbids autocomplete. Both
+  results carry "© OpenStreetMap contributors". Neither has been called for
+  real yet — enabling one in settings is the user's own step.
 
 ### Not planned
 - Google and Outlook — they need OAuth app review, same as the existing plugin.
@@ -464,15 +509,26 @@ was a real family's month before it was sanitised, and an earlier commit of
 it would still be a real family's month; nothing is gained by shipping the
 archaeology and a great deal could be lost.
 
-To publish a release:
+To publish a release — one new commit per release, on top of the last,
+never an amend and never a force-push: a published release's commit is
+what the marketplace and every installed copy point at, and v1.0.0's
+commit is bound to the marketplace submission.
 
 ```bash
-git checkout public && git checkout master -- .   # take master's tree
-GIT_AUTHOR_EMAIL=lancefaul@users.noreply.github.com \
-GIT_COMMITTER_EMAIL=lancefaul@users.noreply.github.com \
-  git commit --amend --author="lancefaul <lancefaul@users.noreply.github.com>"
-git push public public:main --force-with-lease
+git switch refs/heads/public && git checkout master -- .   # master's tree
+GIT_AUTHOR_NAME=lancefaul GIT_AUTHOR_EMAIL=lancefaul@users.noreply.github.com \
+GIT_COMMITTER_NAME=lancefaul GIT_COMMITTER_EMAIL=lancefaul@users.noreply.github.com \
+  git commit -m "omarcal X.Y.Z"
+git push public refs/heads/public:refs/heads/main          # fast-forward
+git tag vX.Y.Z && git push public vX.Y.Z
+gh release create vX.Y.Z -R lancefaul/omarchy-omarcal --target main ...
 ```
+
+The updater reads GitHub's releases/latest, so a tag without a release is
+not an update anyone is offered. Check `git rev-list HEAD` on the public
+branch lists only release commits, all by the no-reply address. A fix for
+a released version goes on `master` and is merged into the working branch,
+so an unreleased feature never rides along.
 
 Before every push, re-run the sweep: no real names, addresses, account
 identifiers, shard hostnames or `@proton` addresses in any tracked file.

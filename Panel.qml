@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import Quickshell
+import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "Logic.js" as Logic
@@ -63,15 +64,374 @@ Panel {
 
   function openEvent(event) {
     if (!event || !event.uid) return
+    if (editorDirty) { requestCancel(function () { root.openEvent(event) }); return }
+    dayNotice = ""
+    cancelEdit()
     viewerSeed = event
     viewerOpen = true
-    if (service) service.loadEvent(event.uid, event.rid || "")
+    if (service) service.loadEvent(event.uid, event.rid || "", event.allDay ? "" : String(event.start || ""))
   }
 
   function closeEvent() {
+    cancelEdit()
     viewerOpen = false
     viewerSeed = null
     if (service) service.clearEvent()
+  }
+
+  // ------------------------------------------------------------- the editor
+  //
+  // The event's form takes the viewer's place in the same column, on a
+  // draft made from what the viewer was showing. Saving and deleting ask
+  // the question a series needs asked, and then — until the helper can
+  // write — say plainly that nothing was sent.
+  property bool editorOpen: false
+  property var draft: null
+  property var draftBase: null
+  // "save" or "delete" while its question is on screen, with the answers
+  // it offers. An empty list of scopes is a plain yes or no.
+  property string pendingAction: ""
+  property var pendingScopes: []
+  property string editNotice: ""
+
+  readonly property bool viewerEditable: Logic.canEdit(viewerEvent)
+  readonly property var draftChanges: editorOpen && draft && draftBase
+    ? Logic.draftChanges(draft, draftBase) : []
+  readonly property string draftProblem: draft ? Logic.draftProblem(draft, inviteeText) : ""
+  readonly property var editCalendars: draft
+    ? Logic.editableCalendars(calendars, draft.calendarUrl) : []
+
+  // The viewer's own zone: what a new event's times are in, and the zone
+  // the pickers offer first.
+  readonly property string localZone: service ? service.localZone : ""
+
+  // True while the form is making a new event rather than changing one.
+  property bool creating: false
+  // Where a new event goes: the one chosen in settings, or the busiest.
+  readonly property string newEventCalendar: Logic.defaultCalendar(
+    calendars, String(pref("defaultCalendar", "")), service ? service.account : "")
+
+  // The form, on a blank event for the selected day. The column the viewer
+  // uses holds it, so it opens where an event would be read.
+  function startNew() {
+    if (newEventCalendar === "") return
+    if (editorDirty) { requestCancel(function () { root.startNew() }); return }
+    dayNotice = ""
+    if (viewerOpen) closeEvent()
+    settingsOpen = false
+    searchOpen = false
+    dayOptionsOpen = false
+    var base = Logic.newEvent(selectedKey, todayKey,
+                              Qt.formatTime(new Date(), "HH:mm"), newEventCalendar)
+    creating = true
+    draftBase = base
+    draft = Logic.editDraft(base, localZone)
+    if (service) service.loadZones()
+    editNotice = ""
+    viewerSeed = null
+    viewerOpen = true
+    editorOpen = true
+  }
+
+  // True once the viewer holds the event's detail, not only the list row.
+  readonly property bool viewerLoaded: !!(viewerEvent && viewerEvent.href)
+  // The new event the form holds is a copy of the one that was open.
+  property bool duplicating: false
+
+  // A copy of the open event, in the new-event form. It goes to the calendar
+  // new events go to when the original's cannot be written to.
+  function startDuplicate() {
+    if (!viewerLoaded || newEventCalendar === "") return
+    var base = Logic.duplicateOf(viewerEvent)
+    var writable = false
+    var usable = Logic.editableCalendars(calendars, "")
+    for (var i = 0; i < usable.length; i++) if (usable[i].value === base.calendarUrl) writable = true
+    if (!writable) base.calendarUrl = newEventCalendar
+    creating = true
+    duplicating = true
+    draftBase = base
+    draft = Logic.editDraft(base, localZone)
+    if (service) service.loadZones()
+    editNotice = ""
+    editorOpen = true
+  }
+
+  function startEdit() {
+    if (!viewerEditable) return
+    draftBase = viewerEvent
+    draft = Logic.editDraft(viewerEvent, localZone)
+    if (service) service.loadZones()
+    editNotice = ""
+    editorOpen = true
+  }
+
+  function cancelEdit() {
+    editorOpen = false
+    // A new event has no viewer to go back to: cancelling it is leaving. A
+    // copy does — the original is still open behind it.
+    if (creating) {
+      if (!duplicating) viewerOpen = false
+      creating = false
+      duplicating = false
+    }
+    attachError = ""
+    inviteeDismissed = false
+    placeQuery = ""
+    if (service) service.clearPlaces()
+    inviteeText = ""
+    inviteeTried = false
+    draft = null
+    draftBase = null
+    pendingAction = ""
+    pendingScopes = []
+    editNotice = ""
+  }
+
+  function setDraft(field, value) {
+    if (draft) draft = Logic.withField(draft, field, value)
+  }
+
+  function setRule(part, value) { if (draft) draft = Logic.withRule(draft, part, value) }
+  function toggleRuleDay(code) { if (draft) draft = Logic.withDayToggled(draft, code) }
+  function setAlert(slot, value) { if (draft) draft = Logic.withAlert(draft, slot, value) }
+
+  // Invitees. The address being typed lives here rather than in the draft:
+  // it is not part of the event until it is added.
+  property string inviteeText: ""
+  // Set when the contact suggestions are clicked away from or dismissed
+  // with Escape; typing again brings them back.
+  property bool inviteeDismissed: false
+  // Set by a failed Add, so the reason shows even before an @ is typed.
+  property bool inviteeTried: false
+  // The account the event's calendar belongs to — the organiser, for an
+  // event it is inviting people to.
+  readonly property string organizerAccount: {
+    if (!draftBase) return ""
+    var url = draft ? draft.calendarUrl : draftBase.calendarUrl
+    for (var i = 0; i < calendars.length; i++)
+      if (calendars[i].url === url) return calendars[i].account || ""
+    return service ? service.account : ""
+  }
+  readonly property bool canInviteHere: !!draftBase && Logic.canInvite(draftBase, organizerAccount)
+  readonly property string inviteeProblem: draft
+    ? Logic.inviteeProblem(draft, inviteeText, organizerAccount) : ""
+  readonly property var inviteeSuggestions: draft && service && service.contactsEnabled
+    ? Logic.contactSuggestions(service.contacts, inviteeText, draft, 5) : []
+
+  function addInvitee(email, name) {
+    if (!draft) return
+    var problem = Logic.inviteeProblem(draft, email, organizerAccount)
+    if (!String(email || "").trim() || problem !== "") { inviteeTried = true; return }
+    draft = Logic.withInvitee(draft, email, name)
+    inviteeText = ""
+    inviteeTried = false
+  }
+
+  function removeInvitee(email) { if (draft) draft = Logic.withoutInvitee(draft, email) }
+  function removeAttachment(index) {
+    if (draft) draft = Logic.withoutAttachment(draft, index)
+    attachError = ""
+  }
+
+  // What is being typed in Address, while it is being typed — the
+  // suggestions follow this rather than the draft, so opening a form on an
+  // event does not start suggesting its own address back.
+  property string placeQuery: ""
+  readonly property var placeMatches: draft && service
+    ? Logic.placeSuggestions(service.placesHistory, placeQuery, 5) : []
+  readonly property var placeLookups: service && service.placeResultsFor !== ""
+    && service.placeResultsFor === placeQuery.trim() ? service.placeResults : []
+  readonly property string placesProvider: service ? service.placesProvider : "none"
+
+  // The suggestion the keyboard is on: the calendar's own first, then the
+  // lookup's, counted as one list. -1 is none; typing starts over.
+  property int placeCurrent: -1
+  onPlaceQueryChanged: placeCurrent = -1
+  property int inviteeCurrent: -1
+  onInviteeTextChanged: inviteeCurrent = -1
+
+  // Up, Down and Enter from the field a suggestion list hangs under. Only
+  // while the list is open, so the field keeps its own keys otherwise.
+  function suggestKey(event, count, current, choose) {
+    if (event.key === Qt.Key_Down) { event.accepted = true; return Math.min(count - 1, current + 1) }
+    if (event.key === Qt.Key_Up) { event.accepted = true; return Math.max(-1, current - 1) }
+    if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && current >= 0) {
+      event.accepted = true
+      choose(current)
+      return -1
+    }
+    return current
+  }
+
+  function typePlace(text) {
+    placeQuery = text
+    if (placesProvider === "photon") placeDebounce.restart()
+  }
+
+  function pickPlace(suggestion) {
+    if (!draft) return
+    draft = Logic.withPlace(draft, suggestion)
+    placeQuery = ""
+    if (service) service.clearPlaces()
+  }
+
+  // Photon is asked once typing pauses, not on every key.
+  Timer {
+    id: placeDebounce
+    interval: 400
+    onTriggered: if (root.service && root.placesProvider === "photon")
+      root.service.searchPlaces(root.placeQuery)
+  }
+
+  // Nominatim's rules allow one search a second at most.
+  property bool nominatimResting: false
+  Timer {
+    id: nominatimRest
+    interval: 1100
+    onTriggered: root.nominatimResting = false
+  }
+
+  function searchNominatim() {
+    if (!service || nominatimResting || placesProvider !== "nominatim") return
+    nominatimResting = true
+    nominatimRest.restart()
+    service.searchPlaces(placeQuery)
+  }
+
+  // Why the last file picked was not added, shown under the list.
+  property string attachError: ""
+
+  // Picking a file to attach. The card steps aside for the desktop's own
+  // file dialog — a window that takes focus would close it anyway — and
+  // comes back on the same form, which closing the card never discards.
+  // The dialog is xdg-desktop-portal's, through the helper: every Omarchy
+  // install has the portal, where zenity is not guaranteed.
+  function pickAttachment() {
+    if (!draft || filePicker.running) return
+    editNotice = ""
+    attachError = ""
+    close()
+    filePicker.running = true
+  }
+
+  Process {
+    id: filePicker
+    running: false
+    command: [service ? service.helper : "", "pick-file"]
+    stdout: StdioCollector { id: pickedOut; waitForEnd: true }
+    onExited: function (exitCode, exitStatus) {
+      var file = Logic.parsePicked(pickedOut.text)
+      if (file && file.error) {
+        root.editNotice = file.error
+        root.editNoticeBad = true
+      } else if (file && root.draft) {
+        var problem = Logic.attachmentProblem(root.draft, file)
+        if (problem) root.attachError = problem
+        else root.draft = Logic.withAttachment(root.draft, file)
+      }
+      root.open()
+    }
+  }
+
+  // The question asked before anything leaves the machine: "contacts" for
+  // reading iCloud Contacts, "photon" or "nominatim" for sending addresses
+  // to a lookup service. Empty when nothing is being asked. Nothing is read
+  // or sent until Allow.
+  property string consentKind: ""
+
+  function allowConsent() {
+    var kind = consentKind
+    consentKind = ""
+    if (!service) return
+    if (kind === "contacts") service.enableContacts()
+    else if (kind === "photon" || kind === "nominatim") service.setPlacesProvider(kind)
+  }
+
+  // A one-off event saves without a question; a series asks how far.
+  function requestSave() {
+    if (!draft || draftProblem !== "") return
+    if (creating) { finishAction("save", ""); return }
+    if (draftChanges.length === 0) return
+    var scopes = Logic.scopeChoices(draftBase, draftChanges)
+    if (scopes.length) { pendingScopes = scopes; pendingAction = "save" }
+    else finishAction("save", "")
+  }
+
+  // A delete always asks, series or not.
+  function requestDelete() {
+    if (!viewerEditable) return
+    pendingScopes = Logic.scopeChoices(viewerEvent, [])
+    pendingAction = "delete"
+  }
+
+  function dismissAction() {
+    pendingAction = ""
+    pendingScopes = []
+  }
+
+  // Unsaved changes are asked about before they are thrown away — by Cancel,
+  // by Escape, and by opening another event or a new one over the form.
+  readonly property bool editorDirty: editorOpen && draftChanges.length > 0
+  // What to do once the changes are discarded, if leaving was for something.
+  property var discardThen: null
+
+  function requestCancel(then) {
+    if (!editorDirty) {
+      cancelEdit()
+      if (then) then()
+      return
+    }
+    discardThen = then || null
+    pendingScopes = []
+    pendingAction = "discard"
+  }
+
+  function finishAction(action, scope) {
+    if (action === "discard") {
+      var then = discardThen
+      discardThen = null
+      dismissAction()
+      cancelEdit()
+      if (then) then()
+      return
+    }
+    if (action !== "save" && action !== "delete") return
+    dismissAction()
+    if (!service || service.writing) return
+    editNotice = ""
+    editNoticeBad = false
+    if (action === "delete")
+      service.deleteEvent(Logic.deleteRequest(viewerEvent, viewerSeed, scope))
+    else
+      service.saveEvent(Logic.saveRequest(draft, draftBase, viewerSeed, scope,
+                                          creating, organizerAccount))
+  }
+
+  // Whether the foot's note is a failure, so it can say so in red.
+  property bool editNoticeBad: false
+  // What the last write came to, said at the top of the day once the form
+  // has closed on it — the form it would have been said in is gone.
+  property string dayNotice: ""
+  property bool dayNoticeBad: true
+
+  Connections {
+    target: root.service
+    function onWriteFinished(action, payload) {
+      var outcome = Logic.writeOutcome(action, payload)
+      if (!outcome.done) {
+        // The form stays open with everything typed in it, and says why.
+        root.editNotice = outcome.message
+        root.editNoticeBad = true
+        return
+      }
+      // Done: back to the day, where the change now shows. Anything that
+      // went wrong on the way (an attachment refused) is said there, and so
+      // is a change kept on this computer until iCloud can be reached.
+      root.closeEvent()
+      root.dayNoticeBad = !outcome.queued
+      root.dayNotice = outcome.message === "Saved." || outcome.message === "Deleted."
+        ? "" : outcome.message
+    }
   }
 
   // Whether a long title or address in the day panel wraps or is cut off.
@@ -445,6 +805,18 @@ Panel {
   // headings, the calendar list under its rule, the weekday row under its.
   readonly property int halfRuleGap: Math.round(ruleGap / 2)
 
+  // A rule between two groups of a form — the edit form's and the
+  // settings' — gets twice the space a rule gets anywhere else on the card,
+  // so a long form reads as groups rather than as one list. Title bars keep
+  // the card's own spacing.
+  //
+  // The column already puts `md` either side of the rule; FormRule adds
+  // another `md` inside its own height. Not a pair of spacer Items: a
+  // Column skips an Item of zero height, spacing and all, so spacers that
+  // came out at zero were never there — and one that is not zero adds its
+  // own gap of spacing as well.
+  readonly property int formRuleInset: Style.spacing.md
+
   // Square, so a glyph sits dead centre both ways. Text buttons take the same
   // height so a row of them has one baseline.
   readonly property int controlSize: Style.space(30)
@@ -516,6 +888,168 @@ Panel {
     height: 2
   }
 
+  component FormRule: Item {
+    width: parent ? parent.width : 0
+    height: 2 + root.formRuleInset * 2
+
+    Rule {
+      y: root.formRuleInset
+      width: parent.width
+    }
+  }
+
+  // One row of a dropdown — the Picker's, and every suggestion list's — so
+  // the two cannot drift apart. A label, an optional note on the right in
+  // the subdued colour, the hover fill, bold when it is the current value.
+  component MenuRow: Rectangle {
+    id: menuRow
+    property string label: ""
+    property string note: ""
+    property bool chosen: false
+    // Wrapping rows grow to fit their label instead of eliding it.
+    property bool wrap: false
+    // Lit by the keyboard, the way the pointer lights it by hovering.
+    property bool highlighted: false
+    readonly property bool lit: menuRowArea.containsMouse || highlighted
+    signal activated()
+
+    height: wrap
+      ? Math.max(Style.spacing.popupRowHeight,
+                 menuRowLabel.implicitHeight + Style.spacing.controlPaddingY * 2)
+      : Style.spacing.popupRowHeight
+    radius: Style.spacing.labelGap
+    color: lit ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent"
+
+    Text {
+      id: menuRowNote
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.rightMargin: Style.spacing.controlPaddingX
+      // At most half the row, so a long address never crowds out the label.
+      width: Math.min(implicitWidth, menuRow.width * 0.5)
+      elide: Text.ElideMiddle
+      visible: menuRow.note !== ""
+      textFormat: Text.PlainText
+      text: menuRow.note
+      color: root.subdued
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+
+    Text {
+      id: menuRowLabel
+      anchors.left: parent.left
+      anchors.right: menuRowNote.visible ? menuRowNote.left : parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.spacing.controlPaddingX
+      anchors.rightMargin: Style.spacing.controlPaddingX
+      textFormat: Text.PlainText
+      text: menuRow.label
+      wrapMode: menuRow.wrap ? Text.WordWrap : Text.NoWrap
+      elide: menuRow.wrap ? Text.ElideNone : Text.ElideRight
+      color: menuRow.lit
+        ? Style.hoverStateColor(root.foreground, Color.accent)
+        : root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+      font.bold: menuRow.chosen
+    }
+
+    MouseArea {
+      id: menuRowArea
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: menuRow.activated()
+    }
+  }
+
+  // A line in a dropdown that is not a choice — "Searching…", a failure,
+  // a credit — set in from the edge the way a row's label is.
+  component MenuCaption: Item {
+    property alias text: menuCaptionText.text
+    property alias color: menuCaptionText.color
+    height: Math.max(Style.spacing.popupRowHeight, menuCaptionText.implicitHeight)
+
+    Text {
+      id: menuCaptionText
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.spacing.controlPaddingX
+      anchors.rightMargin: Style.spacing.controlPaddingX
+      wrapMode: Text.WordWrap
+      textFormat: Text.PlainText
+      color: root.subdued
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+  }
+
+  // The popup every dropdown on the card opens, as tall as its rows plus
+  // the padding. The same flat outline every other surface on the card
+  // wears. The kit's dropdown uses `Color.popups.border` here, which on this
+  // theme is a green gradient: it brightens around the shape and blazes at
+  // the corners, so a two-line menu ends up the loudest thing on screen and
+  // matches nothing next to it — least of all the trigger it drops out of.
+  component MenuPopup: Popup {
+    padding: Style.spacing.hairline
+
+    background: BorderSurface {
+      color: Color.popups.background
+      radius: Style.cornerRadius
+      borderSpec: Border.controlSpec("normal", root.foreground, Color.accent)
+    }
+  }
+
+  // A dropdown of suggestions under a field that is still being typed in.
+  // It never covers that field: it opens below it when the rows fit there,
+  // above it when there is more room above, and scrolls when neither side
+  // holds them all. The room is the card's own — a list that ran past the
+  // card's edge would be drawn over whatever is behind it.
+  component SuggestMenu: MenuPopup {
+    id: suggestMenu
+    property Item anchor: null
+    default property alias rows: suggestRows.data
+    readonly property real natural: suggestRows.implicitHeight + topPadding + bottomPadding
+
+    focus: false
+    margins: -1
+    closePolicy: Popup.CloseOnPressOutsideParent
+
+    function fit() {
+      if (!anchor) return
+      var gap = Style.spacing.xxs
+      var edge = Style.spacing.md
+      var top = anchor.mapToItem(keyCatcher, 0, 0).y
+      var below = keyCatcher.height - (top + anchor.height + gap) - edge
+      var above = top - gap - edge
+      var downward = natural <= below || below >= above
+      height = Math.max(Style.spacing.popupRowHeight,
+                        Math.min(natural, downward ? below : above))
+      y = downward ? anchor.height + gap : -height - gap
+    }
+
+    onAboutToShow: fit()
+    onNaturalChanged: if (opened) fit()
+
+    contentItem: Flickable {
+      clip: true
+      contentHeight: suggestRows.implicitHeight
+      boundsBehavior: Flickable.StopAtBounds
+      ScrollBar.vertical: ScrollBar {
+        policy: suggestRows.implicitHeight > suggestMenu.availableHeight
+                ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+      }
+
+      Column {
+        id: suggestRows
+        width: suggestMenu.availableWidth
+        spacing: Style.spacing.labelGap
+      }
+    }
+  }
+
   // A dropdown that does not move under the pointer.
   //
   // qs.Ui's `Dropdown` sizes its popup by hand — every row, plus the gaps,
@@ -542,11 +1076,26 @@ Panel {
     signal picked(string value)
 
     readonly property bool open: menu.opened
+    // The row the keyboard is on while the menu is open.
+    property int current: -1
+
+    function step(by) {
+      if (!options.length) return
+      current = Math.max(0, Math.min(options.length - 1, (current < 0 ? -1 : current) + by))
+    }
 
     function labelFor(wanted) {
       for (var i = 0; i < options.length; i++)
         if (String(options[i].value) === String(wanted)) return options[i].label
       return wanted
+    }
+
+    // The chosen row's note, shown on the closed trigger as in the list, so
+    // two options with one name can be told apart before it is opened.
+    function noteFor(wanted) {
+      for (var i = 0; i < options.length; i++)
+        if (String(options[i].value) === String(wanted)) return options[i].note || ""
+      return ""
     }
 
     BorderSurface {
@@ -561,8 +1110,23 @@ Panel {
                                      root.foreground, Color.accent)
 
       Text {
-        anchors.left: parent.left
+        id: triggerNote
         anchors.right: chevron.left
+        anchors.verticalCenter: parent.verticalCenter
+        anchors.rightMargin: Style.spacing.md
+        width: Math.min(implicitWidth, trigger.width * 0.45)
+        elide: Text.ElideMiddle
+        visible: text !== ""
+        textFormat: Text.PlainText
+        text: picker.noteFor(picker.value)
+        color: root.subdued
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+
+      Text {
+        anchors.left: parent.left
+        anchors.right: triggerNote.visible ? triggerNote.left : chevron.left
         anchors.verticalCenter: parent.verticalCenter
         anchors.leftMargin: Style.spacing.controlPaddingX
         anchors.rightMargin: Style.spacing.md
@@ -595,68 +1159,55 @@ Panel {
       }
     }
 
-    Popup {
+    MenuPopup {
       id: menu
       y: picker.rowHeight + Style.spacing.xxs
       width: picker.width
-      padding: Style.spacing.hairline
       // No implicitHeight of its own: it is however tall the rows are plus
       // the padding, which is the whole point.
 
-      // The same flat outline every other surface on the card wears. The
-      // kit's dropdown uses `Color.popups.border` here, which on this theme
-      // is a green gradient: it brightens around the shape and blazes at the
-      // corners, so a two-line menu ends up the loudest thing on screen and
-      // matches nothing next to it — least of all the trigger it drops out of.
-      background: BorderSurface {
-        color: Color.popups.background
-        radius: Style.cornerRadius
-        borderSpec: Border.controlSpec("normal", root.foreground, Color.accent)
+      // Opened by the pointer or not, the keyboard can take it from there:
+      // arrows move, Enter or Space picks, Escape closes.
+      onOpened: {
+        picker.current = -1
+        for (var i = 0; i < picker.options.length; i++)
+          if (String(picker.options[i].value) === String(picker.value)) picker.current = i
+        menuRows.forceActiveFocus()
       }
+      onClosed: keyCatcher.forceActiveFocus()
 
       contentItem: Column {
+        id: menuRows
         spacing: Style.spacing.labelGap
+        focus: true
+
+        Keys.onPressed: function (event) {
+          if (event.key === Qt.Key_Down) { picker.step(1); event.accepted = true }
+          else if (event.key === Qt.Key_Up) { picker.step(-1); event.accepted = true }
+          else if (event.key === Qt.Key_Escape) { menu.close(); event.accepted = true }
+          else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter
+                    || event.key === Qt.Key_Space) && picker.current >= 0) {
+            var chosen = picker.options[picker.current]
+            menu.close()
+            picker.picked(String(chosen.value))
+            event.accepted = true
+          }
+        }
 
         Repeater {
           model: picker.options
 
-          Rectangle {
+          MenuRow {
             required property var modelData
-            readonly property bool chosen:
-              String(modelData.value) === String(picker.value)
+            required property int index
+            highlighted: index === picker.current
             width: menu.availableWidth
-            height: Style.spacing.popupRowHeight
-            radius: Style.spacing.labelGap
-            color: rowArea.containsMouse
-              ? Style.hoverFillFor(root.foreground, Color.accent)
-              : "transparent"
-
-            Text {
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              anchors.leftMargin: Style.spacing.controlPaddingX
-              anchors.rightMargin: Style.spacing.controlPaddingX
-              textFormat: Text.PlainText
-              text: modelData.label
-              elide: Text.ElideRight
-              color: rowArea.containsMouse
-                ? Style.hoverStateColor(root.foreground, Color.accent)
-                : root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              font.bold: parent.chosen
-            }
-
-            MouseArea {
-              id: rowArea
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: {
-                menu.close()
-                picker.picked(String(modelData.value))
-              }
+            label: modelData.label
+            note: modelData.note || ""
+            chosen: String(modelData.value) === String(picker.value)
+            onActivated: {
+              menu.close()
+              picker.picked(String(modelData.value))
             }
           }
         }
@@ -965,6 +1516,533 @@ Panel {
     }
   }
 
+  // ------------------------------------------------------- editor controls
+  //
+  // The kit has a single-line field and a dropdown, and nothing for a date,
+  // a time or a paragraph. These three are built from the same parts as the
+  // Picker — a BorderSurface trigger in the kit's fill and border states, a
+  // Popup in the card's flat outline — so the form reads as one set.
+
+  // One suggestion under a field: a line of what it is, a line of detail,
+  // the whole row clickable. The shape the invitee suggestions use.
+  component SuggestionRow: Rectangle {
+    id: suggestion
+    property string title: ""
+    property string detail: ""
+    signal chosen()
+
+    width: parent ? parent.width : 0
+    height: suggestionLines.implicitHeight + Style.space(8)
+    radius: Style.spacing.labelGap
+    color: suggestionHover.containsMouse
+      ? Style.hoverFillFor(root.foreground, Color.accent)
+      : Style.normalFillFor(root.foreground, Color.accent)
+
+    Column {
+      id: suggestionLines
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.leftMargin: Style.spacing.controlPaddingX
+      anchors.rightMargin: Style.spacing.controlPaddingX
+      anchors.verticalCenter: parent.verticalCenter
+
+      Text {
+        width: parent.width
+        elide: Text.ElideRight
+        textFormat: Text.PlainText
+        text: suggestion.title
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      Text {
+        width: parent.width
+        visible: suggestion.detail !== ""
+        elide: Text.ElideRight
+        textFormat: Text.PlainText
+        text: suggestion.detail
+        color: root.subdued
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+    }
+
+    MouseArea {
+      id: suggestionHover
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: suggestion.chosen()
+    }
+  }
+
+  // A label over whatever field follows it, in the settings' own type.
+  component FormLabel: Text {
+    width: parent ? parent.width : 0
+    textFormat: Text.PlainText
+    elide: Text.ElideRight
+    color: root.foreground
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.bodySmall
+  }
+
+  // The trigger every popup field opens from: its value, a glyph on the
+  // right, and the kit's states. `open` is the popup's, so it lights while
+  // the popup is up the way the Picker does.
+  component FieldTrigger: BorderSurface {
+    id: fieldTrigger
+    property string text: ""
+    property string glyph: "\udb80\udd40"
+    property bool open: false
+    signal clicked()
+
+    height: root.fieldHeight
+    radius: Style.cornerRadius
+    readonly property bool hot: fieldArea.containsMouse || open
+    color: Style.controlFill(open, hot, root.foreground, Color.accent)
+    borderSpec: Border.controlSpec(open ? "focus" : hot ? "hover-cursor" : "normal",
+                                   root.foreground, Color.accent)
+
+    Text {
+      anchors.left: parent.left
+      anchors.right: fieldGlyph.left
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.spacing.controlPaddingX
+      anchors.rightMargin: Style.space(6)
+      textFormat: Text.PlainText
+      text: fieldTrigger.text
+      elide: Text.ElideRight
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+    }
+
+    Text {
+      id: fieldGlyph
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.rightMargin: Style.spacing.controlGap
+      textFormat: Text.PlainText
+      text: fieldTrigger.glyph
+      color: Qt.darker(root.foreground, 1.2)
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+    }
+
+    MouseArea {
+      id: fieldArea
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: fieldTrigger.clicked()
+    }
+  }
+
+  // A time zone, picked from all of them by typing part of a place: the
+  // list is the helper's, searched here. Opened, it takes the keyboard —
+  // type to narrow, Up and Down to move, Enter to choose, Escape to leave.
+  component ZoneField: Item {
+    id: zoneField
+    property string value: ""
+    signal picked(string value)
+
+    implicitHeight: root.fieldHeight
+    height: root.fieldHeight
+
+    property string query: ""
+    property int current: 0
+    readonly property var zones: root.service ? root.service.zones : []
+    readonly property var rows: Logic.zoneChoices(zones, query, root.localZone, 40)
+    onQueryChanged: current = 0
+
+    function choose(i) {
+      if (i < 0 || i >= rows.length) return
+      zonePop.close()
+      zoneField.picked(rows[i].value)
+    }
+
+    FieldTrigger {
+      anchors.fill: parent
+      text: Logic.zoneLabel(zoneField.value, zoneField.zones, root.localZone)
+      glyph: "\uf0ac"
+      open: zonePop.opened
+      onClicked: zonePop.opened ? zonePop.close() : zonePop.open()
+    }
+
+    MenuPopup {
+      id: zonePop
+      y: zoneField.height + Style.spacing.xxs
+      width: zoneField.width
+      height: Math.min(Style.space(300),
+                       zoneColumn.implicitHeight + topPadding + bottomPadding)
+      margins: 0
+
+      onOpened: { zoneField.query = ""; zoneSearch.text = ""; zoneSearch.forceActiveFocus() }
+      onClosed: keyCatcher.forceActiveFocus()
+
+      contentItem: Column {
+        id: zoneColumn
+        spacing: Style.spacing.labelGap
+
+        TextField {
+          id: zoneSearch
+          width: zonePop.availableWidth
+          height: root.fieldHeight
+          placeholderText: "Search a city or region"
+          foreground: root.foreground
+          onTextEdited: zoneField.query = text
+          Keys.onPressed: function (event) {
+            if (event.key === Qt.Key_Down) {
+              zoneField.current = Math.min(zoneField.rows.length - 1, zoneField.current + 1)
+              event.accepted = true
+            } else if (event.key === Qt.Key_Up) {
+              zoneField.current = Math.max(0, zoneField.current - 1)
+              event.accepted = true
+            } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+              zoneField.choose(zoneField.current)
+              event.accepted = true
+            } else if (event.key === Qt.Key_Escape) {
+              zonePop.close()
+              event.accepted = true
+            }
+          }
+        }
+
+        Flickable {
+          id: zoneScroll
+          width: zonePop.availableWidth
+          height: Math.min(contentHeight, Style.space(240))
+          contentHeight: zoneList.implicitHeight
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+          Column {
+            id: zoneList
+            width: zoneScroll.width
+            spacing: Style.spacing.labelGap
+
+            Repeater {
+              model: zoneField.rows
+              MenuRow {
+                required property var modelData
+                required property int index
+                width: zoneList.width
+                label: modelData.label
+                note: modelData.note
+                chosen: modelData.value === zoneField.value
+                highlighted: index === zoneField.current
+                onActivated: zoneField.choose(index)
+              }
+            }
+          }
+        }
+
+        MenuCaption {
+          visible: zoneField.rows.length === 0
+          width: zonePop.availableWidth
+          text: zoneField.zones.length ? "No time zone matches that." : "Loading time zones\u2026"
+        }
+      }
+    }
+  }
+
+  // A date, picked off a month. The month is the card's own grid function,
+  // so the week starts where the card's does and today is marked the same.
+  component DateField: Item {
+    id: dateField
+    property string value: ""
+    signal picked(string value)
+
+    implicitHeight: root.fieldHeight
+    height: root.fieldHeight
+
+    // The month on show in the popup, reset to the value's each time it
+    // opens rather than left wherever it was last paged to.
+    property int shownYear: 2026
+    property int shownMonth: 1
+
+    function page(step) {
+      var m = shownMonth + step, y = shownYear
+      while (m < 1) { m += 12; y -= 1 }
+      while (m > 12) { m -= 12; y += 1 }
+      shownYear = y
+      shownMonth = m
+    }
+
+    FieldTrigger {
+      anchors.fill: parent
+      text: Logic.shortDate(dateField.value)
+      glyph: "\uf073"
+      open: calendarPop.opened
+      onClicked: {
+        if (calendarPop.opened) { calendarPop.close(); return }
+        var p = Logic.parseKey(Logic.isDateKey(dateField.value)
+                               ? dateField.value : root.todayKey)
+        dateField.shownYear = p.y
+        dateField.shownMonth = p.m
+        calendarPop.open()
+      }
+    }
+
+    Popup {
+      id: calendarPop
+      y: dateField.height + Style.spacing.xxs
+      width: Math.max(dateField.width, Style.space(224))
+      padding: Style.spacing.md
+      // Kept inside the card: near the foot of the form the month moves up
+      // over its field rather than running off the bottom.
+      margins: 0
+
+      background: BorderSurface {
+        color: Color.popups.background
+        radius: Style.cornerRadius
+        borderSpec: Border.controlSpec("normal", root.foreground, Color.accent)
+      }
+
+      contentItem: Column {
+        spacing: Style.space(4)
+
+        Item {
+          width: calendarPop.availableWidth
+          height: root.controlSize
+
+          Button {
+            anchors.left: parent.left
+            width: root.controlSize
+            height: root.controlSize
+            iconText: "\uf053"
+            tooltipText: "Previous month"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: dateField.page(-1)
+          }
+
+          Text {
+            anchors.centerIn: parent
+            textFormat: Text.PlainText
+            text: Logic.monthLabel(dateField.shownYear, dateField.shownMonth)
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+          }
+
+          Button {
+            anchors.right: parent.right
+            width: root.controlSize
+            height: root.controlSize
+            iconText: "\uf054"
+            tooltipText: "Next month"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: dateField.page(1)
+          }
+        }
+
+        Grid {
+          id: dateGrid
+          columns: 7
+          readonly property real cell: calendarPop.availableWidth / 7
+
+          Repeater {
+            model: Logic.weekdayLabels(root.weekStartDay, 2)
+
+            Text {
+              required property string modelData
+              width: dateGrid.cell
+              horizontalAlignment: Text.AlignHCenter
+              textFormat: Text.PlainText
+              text: modelData
+              color: root.subdued
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          Repeater {
+            model: Logic.monthGrid(dateField.shownYear, dateField.shownMonth,
+                                   root.weekStartDay, root.todayKey)
+
+            Rectangle {
+              required property var modelData
+              readonly property bool chosen: modelData.key === dateField.value
+              width: dateGrid.cell
+              height: Math.round(dateGrid.cell * 0.9)
+              radius: Style.spacing.labelGap
+              color: chosen ? Style.selectedFillFor(root.foreground, Color.accent)
+                   : dayArea.containsMouse ? Style.hoverFillFor(root.foreground, Color.accent)
+                   : "transparent"
+              border.width: modelData.isToday ? 1 : 0
+              border.color: Color.accent
+
+              Text {
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: String(parent.modelData.day)
+                color: parent.modelData.inMonth ? root.foreground : root.subdued
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: parent.chosen
+              }
+
+              MouseArea {
+                id: dayArea
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  calendarPop.close()
+                  dateField.picked(parent.modelData.key)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // A time, off a list of every quarter hour. Ninety-six rows do not fit
+  // on a card the way a Picker's handful do, so this one scrolls — and it
+  // opens scrolled to the time it holds, not to midnight.
+  component TimeField: Item {
+    id: timeField
+    property string value: ""
+    signal picked(string value)
+
+    implicitHeight: root.fieldHeight
+    height: root.fieldHeight
+
+    readonly property var choices: Logic.timeChoices(root.timeFormat, value)
+
+    function labelFor(wanted) {
+      for (var i = 0; i < choices.length; i++)
+        if (choices[i].value === wanted) return choices[i].label
+      return wanted
+    }
+
+    FieldTrigger {
+      anchors.fill: parent
+      text: timeField.labelFor(timeField.value)
+      open: timePop.opened
+      onClicked: timePop.opened ? timePop.close() : timePop.open()
+    }
+
+    Popup {
+      id: timePop
+      y: timeField.height + Style.spacing.xxs
+      width: Math.max(timeField.width, Style.space(110))
+      height: Math.min(Style.space(220), timeList.implicitHeight + padding * 2)
+      padding: Style.spacing.hairline
+      margins: 0
+
+      onOpened: {
+        for (var i = 0; i < timeField.choices.length; i++) {
+          if (timeField.choices[i].value !== timeField.value) continue
+          var row = Style.spacing.popupRowHeight + Style.spacing.labelGap
+          // A few rows of context above it, so it is not the top line.
+          timeScroll.contentY = Math.max(0, Math.min(
+            i * row - row * 3, timeScroll.contentHeight - timeScroll.height))
+          break
+        }
+      }
+
+      background: BorderSurface {
+        color: Color.popups.background
+        radius: Style.cornerRadius
+        borderSpec: Border.controlSpec("normal", root.foreground, Color.accent)
+      }
+
+      contentItem: Flickable {
+        id: timeScroll
+        clip: true
+        contentHeight: timeList.implicitHeight
+        boundsBehavior: Flickable.StopAtBounds
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+        Column {
+          id: timeList
+          width: timeScroll.width
+          spacing: Style.spacing.labelGap
+
+          Repeater {
+            model: timeField.choices
+
+            Rectangle {
+              required property var modelData
+              readonly property bool chosen: modelData.value === timeField.value
+              width: timeList.width
+              height: Style.spacing.popupRowHeight
+              radius: Style.spacing.labelGap
+              color: timeArea.containsMouse
+                ? Style.hoverFillFor(root.foreground, Color.accent)
+                : chosen ? Style.selectedFillFor(root.foreground, Color.accent)
+                : "transparent"
+
+              Text {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: Style.spacing.controlPaddingX
+                textFormat: Text.PlainText
+                text: parent.modelData.label
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: parent.chosen
+              }
+
+              MouseArea {
+                id: timeArea
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  timePop.close()
+                  timeField.picked(parent.modelData.value)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // A paragraph. The kit's TextField is one line, and notes are rarely one,
+  // so this is Qt's TextArea dressed the way that field dresses itself.
+  component NoteField: TextArea {
+    id: noteField
+    readonly property var edgeSpec: Border.controlSpec(
+      activeFocus ? "focus" : hovered ? "hover-cursor" : "normal",
+      root.foreground, Color.accent)
+
+    wrapMode: TextEdit.Wrap
+    textFormat: TextEdit.PlainText
+    color: root.foreground
+    selectionColor: Style.selectionFillFor(root.foreground, Color.accent)
+    selectedTextColor: root.foreground
+    placeholderTextColor: Qt.darker(root.foreground, 1.6)
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.body
+    leftPadding: Style.spacing.controlPaddingX + Border.left(edgeSpec)
+    rightPadding: Style.spacing.controlPaddingX + Border.right(edgeSpec)
+    topPadding: Style.spacing.inputPaddingY + Border.top(edgeSpec)
+    bottomPadding: Style.spacing.inputPaddingY + Border.bottom(edgeSpec)
+    // Three lines before it grows, so it looks like somewhere to write.
+    property int minLines: 3
+    implicitHeight: Math.max(contentHeight, root.bodyLine * minLines)
+                    + topPadding + bottomPadding
+
+    background: BorderSurface {
+      color: Style.controlFill(noteField.activeFocus, noteField.hovered,
+                               root.foreground, Color.accent)
+      borderSpec: noteField.edgeSpec
+      radius: Style.cornerRadius
+    }
+  }
+
   // A heading over its count, in the shape the calendar list uses for its
   // provider over its account.
   component DaySection: Column {
@@ -1060,7 +2138,9 @@ Panel {
       Text {
         width: parent.width
         elide: Text.ElideRight
+        // A change of ours not yet on iCloud says so where its time is.
         text: Logic.formatRange(dayEntry.event, dayEntry.timeFormat)
+          + (dayEntry.event.pending ? "  \u00b7  \uf017 not sent yet" : "")
         color: root.subdued
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -1333,7 +2413,13 @@ Panel {
       // Escape peels one layer at a time: whatever is over the card goes
       // first, and only a card with nothing over it closes.
       onCloseRequested: {
-        if (root.viewerOpen) root.closeEvent()
+        if (root.placeQuery !== "") root.placeQuery = ""
+        else if (root.inviteeSuggestions.length > 0 && !root.inviteeDismissed)
+          root.inviteeDismissed = true
+        else if (root.consentKind !== "") root.consentKind = ""
+        else if (root.pendingAction !== "") root.dismissAction()
+        else if (root.editorOpen) root.requestCancel(null)
+        else if (root.viewerOpen) root.closeEvent()
         else if (root.searchOpen) root.closeSearch()
         else if (root.pendingForget) root.pendingForget = null
         else if (root.helpOpen) root.helpOpen = false
@@ -1748,8 +2834,8 @@ Panel {
             visible: root.settingsOpen
             anchors.top: settingsHead.bottom
             anchors.bottom: sidebarFoot.top
-            anchors.topMargin: root.halfRuleGap
-            anchors.bottomMargin: root.ruleGap
+            anchors.topMargin: root.ruleGap
+            anchors.bottomMargin: root.ruleGap * 2
             contentHeight: settingsList.implicitHeight
 
             Column {
@@ -1929,11 +3015,7 @@ Panel {
                 }
               }
 
-              Item { width: 1; height: Math.max(0, root.halfRuleGap - Style.spacing.md * 2) }
-
-              Rule { width: parent.width }
-
-              Item { width: 1; height: Math.max(0, root.halfRuleGap - Style.spacing.md * 2) }
+              FormRule { }
 
               // ------------------------------------------------- the month
 
@@ -1986,11 +3068,7 @@ Panel {
                 onToggled: root.setPref("showWeekNumbers", !root.showWeekNumbers)
               }
 
-              Item { width: 1; height: Math.max(0, root.halfRuleGap - Style.spacing.md * 2) }
-
-              Rule { width: parent.width }
-
-              Item { width: 1; height: Math.max(0, root.halfRuleGap - Style.spacing.md * 2) }
+              FormRule { }
 
               // ------------------------------------------- day and week
 
@@ -2053,11 +3131,7 @@ Panel {
                 }
               }
 
-              Item { width: 1; height: Math.max(0, root.halfRuleGap - Style.spacing.md * 2) }
-
-              Rule { width: parent.width }
-
-              Item { width: 1; height: Math.max(0, root.halfRuleGap - Style.spacing.md * 2) }
+              FormRule { }
 
               // -------------------------------------------------- syncing
 
@@ -2087,11 +3161,124 @@ Panel {
                 font.pixelSize: Style.font.caption
               }
 
-              Item { width: 1; height: Math.max(0, root.halfRuleGap - Style.spacing.md * 2) }
+              FormRule { }
 
-              Rule { width: parent.width }
+              // ------------------------------------------------- contacts
 
-              Item { width: 1; height: Math.max(0, root.halfRuleGap - Style.spacing.md * 2) }
+              PanelSectionHeader { width: parent.width; text: "CONTACTS" }
+
+              // On asks first, in so many words; off deletes what was kept.
+              SettingSwitch {
+                label: "Suggest invitees from iCloud Contacts"
+                hint: root.service ? Logic.contactsStatusLine(
+                  root.service.contactsEnabled, root.service.contactCount,
+                  root.service.contactsError) : ""
+                checked: !!root.service && root.service.contactsEnabled
+                onToggled: {
+                  if (!root.service) return
+                  if (root.service.contactsEnabled) root.service.disableContacts()
+                  else root.consentKind = "contacts"
+                }
+              }
+
+              Button {
+                visible: !!root.service && root.service.contactsEnabled
+                width: parent.width
+                height: root.controlSize
+                bordered: true
+                iconText: "\uf021"
+                iconSpinning: !!root.service && root.service.contactsSyncing
+                text: "Refresh contacts"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: root.service.syncContacts()
+              }
+
+              FormRule { }
+
+              // ----------------------------------------------- new events
+
+              PanelSectionHeader { width: parent.width; text: "NEW EVENTS" }
+
+              Column {
+                width: parent.width
+                spacing: Style.space(4)
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: "Add new events to"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                Picker {
+                  width: parent.width
+                  options: Logic.editableCalendars(root.calendars, root.newEventCalendar)
+                  value: root.newEventCalendar
+                  onPicked: function (choice) { root.setPref("defaultCalendar", choice) }
+                }
+
+                Text {
+                  width: parent.width
+                  readonly property string said: Logic.defaultCalendarNote(
+                    root.calendars, String(root.pref("defaultCalendar", "")),
+                    root.service ? root.service.account : "")
+                  visible: said !== ""
+                  wrapMode: Text.WordWrap
+                  textFormat: Text.PlainText
+                  text: said
+                  color: root.subdued
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              FormRule { }
+
+              // ------------------------------------------- address search
+
+              PanelSectionHeader { width: parent.width; text: "ADDRESS SEARCH" }
+
+              // The calendar's own addresses are always suggested. Choosing
+              // a service asks first, because what is typed goes to it.
+              Column {
+                width: parent.width
+                spacing: Style.space(4)
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: "Look up new places with"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                Picker {
+                  width: parent.width
+                  options: Logic.placeProviders()
+                  value: root.placesProvider
+                  onPicked: function (choice) {
+                    if (!root.service || choice === root.placesProvider) return
+                    if (choice === "none") root.service.setPlacesProvider("none")
+                    else root.consentKind = choice
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                  textFormat: Text.PlainText
+                  text: Logic.placesStatusLine(root.placesProvider)
+                  color: root.subdued
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              FormRule { }
 
               // ------------------------------------------------ bar clock
 
@@ -2810,6 +3997,23 @@ Panel {
                   foreground: root.foreground
                   fontFamily: root.fontFamily
                   onClicked: root.stepView(1)
+                }
+
+                // Moving through time on the left of the line, making
+                // something on the right of it.
+                VRule { height: root.controlSize }
+
+                Button {
+                  width: root.controlSize
+                  height: root.controlSize
+                  bordered: true
+                  iconText: "\uf067"
+                  tooltipText: "New event on " + Logic.formatDayLabel(root.selectedKey)
+                  enabled: root.newEventCalendar !== ""
+                  opacity: enabled ? 1.0 : 0.4
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: root.startNew()
                 }
               }
             }
@@ -3735,6 +4939,63 @@ Panel {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
           }
+
+          // Saved here while iCloud could not be reached, and not sent yet.
+          Text {
+            visible: !!root.service && root.service.pendingCount > 0
+            width: calendarColumn.width
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            text: !root.service ? "" : (root.service.pendingCount === 1
+              ? "1 change is waiting to be sent to iCloud."
+              : root.service.pendingCount + " changes are waiting to be sent to iCloud.")
+              + " It goes with the next sync."
+            color: root.subdued
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          // And any iCloud refused when they were sent: already taken off the
+          // calendar, said here until the person has seen it.
+          Repeater {
+            model: root.service ? root.service.pendingProblems : []
+
+            Item {
+              required property var modelData
+              width: calendarColumn.width
+              height: Math.max(problemText.implicitHeight, root.controlSize)
+
+              Text {
+                id: problemText
+                anchors.left: parent.left
+                anchors.right: dismissProblem.left
+                anchors.rightMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                text: "\u201c" + (modelData.title || "An event") + "\u201d wasn\u2019t "
+                  + (modelData.action === "delete" ? "deleted" : "saved") + " on iCloud: "
+                  + modelData.error
+                color: root.danger
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Button {
+                id: dismissProblem
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                width: root.controlSize
+                height: root.controlSize
+                bordered: true
+                iconText: "\uf00d"
+                tooltipText: "Dismiss"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: root.service.dismissPending(modelData.id)
+              }
+            }
+          }
         }
 
         // --------------------------------------------------------- divider
@@ -3838,6 +5099,20 @@ Panel {
               spacing: 0
               visible: !root.viewerOpen
 
+              // What the last save or delete came to, when it was not simply
+              // done: an attachment iCloud refused, say.
+              Text {
+                width: daySidebar.width
+                visible: root.dayNotice !== ""
+                topPadding: root.halfRuleGap
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                text: root.dayNotice
+                color: root.dayNoticeBad ? root.danger : root.subdued
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
             // The whole section goes when the day has none: a heading reading
             // "All Day / None" over nothing is a row of furniture, not
             // information. Its closing rule goes with it, leaving the day's
@@ -3905,7 +5180,7 @@ Panel {
               id: viewerHead
               width: daySidebar.width
               spacing: 0
-              visible: root.viewerOpen
+              visible: root.viewerOpen && !root.editorOpen
 
               Item { width: 1; height: root.halfRuleGap }
 
@@ -3996,19 +5271,58 @@ Panel {
 
               Item { width: 1; height: root.halfRuleGap }
             }
+
+            // The form's own heading, where the event's title was: the title
+            // is the first field now, and the heading says what the column
+            // has become and whether anything in it has been changed.
+            Column {
+              id: editorHead
+              width: daySidebar.width
+              spacing: 0
+              visible: root.editorOpen
+
+              Item { width: 1; height: root.halfRuleGap }
+
+              DaySection {
+                width: daySidebar.width
+                title: root.creating ? "NEW EVENT" : "EDIT EVENT"
+                subtitle: root.duplicating ? "A copy \u2014 not saved yet"
+                  : root.creating ? "Not saved yet"
+                  : root.draftChanges.length === 0 ? "No changes yet"
+                  : root.draftChanges.length === 1 ? "1 unsaved change"
+                  : root.draftChanges.length + " unsaved changes"
+              }
+
+              Item { width: 1; height: root.halfRuleGap }
+
+              Rule { width: daySidebar.width }
+            }
           }
 
           // The event's own parts, each ruled off from the one above it.
           Scroller {
-            visible: root.viewerOpen
+            visible: root.viewerOpen && !root.editorOpen
             anchors.top: dayHead.bottom
-            anchors.bottom: parent.bottom
+            anchors.bottom: dayFoot.top
+            anchors.bottomMargin: root.ruleGap
             contentHeight: viewerBody.implicitHeight
 
             Column {
               id: viewerBody
               width: daySidebar.width
               spacing: Style.spacing.md
+
+              // Saved here while iCloud could not be reached.
+              Text {
+                width: parent.width
+                visible: !!(root.viewerSeed && root.viewerSeed.pending)
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                text: "\uf017  Not sent to iCloud yet \u2014 it goes with the next sync."
+                color: root.subdued
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
 
               DetailField {
                 label: "When"
@@ -4035,6 +5349,15 @@ Panel {
                 label: "Alerts"
                 lines: root.viewerEvent
                   ? Logic.alarmLines(root.viewerEvent.alarms) : []
+              }
+
+              DetailField {
+                label: "Travel time"
+                lines: {
+                  var minutes = root.viewerEvent && !root.viewerEvent.allDay
+                    ? Logic.durationMinutes(root.viewerEvent.travel) : null
+                  return minutes > 0 ? [Logic.travelLabel(Math.round(minutes))] : []
+                }
               }
 
               DetailField {
@@ -4077,6 +5400,12 @@ Panel {
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
                 }
+              }
+
+              DetailField {
+                label: "Attachments"
+                lines: root.viewerEvent
+                  ? Logic.attachmentLines(root.viewerEvent.attachments) : []
               }
 
               // The link readable and copiable as well as clickable, the way
@@ -4193,6 +5522,931 @@ Panel {
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
         }
+            }
+          }
+
+          // The form, in the order the event reads in the viewer: what, which
+          // calendar, when, how often, what reminds you, then the rest.
+          Scroller {
+            visible: root.editorOpen
+            anchors.top: dayHead.bottom
+            anchors.bottom: dayFoot.top
+            anchors.topMargin: root.ruleGap
+            anchors.bottomMargin: root.ruleGap * 2
+            contentHeight: editorBody.implicitHeight
+
+            Column {
+              id: editorBody
+              width: daySidebar.width
+              spacing: Style.spacing.md
+
+              readonly property real dateWidth:
+                Math.round((width - Style.spacing.sm) * 0.6)
+              readonly property var d: root.draft || ({})
+
+              // Grouped the way the viewer reads, each group headed and ruled
+              // off from the next, like the settings.
+
+              PanelSectionHeader { width: parent.width; text: "EVENT" }
+
+              Column {
+                width: parent.width
+                spacing: Style.space(4)
+                FormLabel { text: "Title" }
+                TextField {
+                  width: parent.width
+                  height: root.fieldHeight
+                  text: editorBody.d.title || ""
+                  foreground: root.foreground
+                  onTextEdited: root.setDraft("title", text)
+                }
+              }
+
+              Column {
+                width: parent.width
+                spacing: Style.space(4)
+                FormLabel { text: "Calendar" }
+                Picker {
+                  width: parent.width
+                  options: root.editCalendars
+                  value: editorBody.d.calendarUrl || ""
+                  onPicked: function (choice) { root.setDraft("calendarUrl", choice) }
+                }
+
+                // Only for an event that already exists somewhere: a new one
+                // is not being moved, just put in the other account.
+                Text {
+                  width: parent.width
+                  readonly property string said: root.creating || !root.draftBase ? ""
+                    : Logic.moveNote(root.calendars, root.draftBase.calendarUrl,
+                                     editorBody.d.calendarUrl)
+                  visible: said !== ""
+                  wrapMode: Text.WordWrap
+                  textFormat: Text.PlainText
+                  text: said
+                  color: root.subdued
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              FormRule { }
+
+              PanelSectionHeader { width: parent.width; text: "SCHEDULE" }
+
+              SettingSwitch {
+                label: "All day"
+                checked: !!editorBody.d.allDay
+                onToggled: root.setDraft("allDay", !editorBody.d.allDay)
+              }
+
+              Column {
+                width: parent.width
+                spacing: Style.space(4)
+                FormLabel { text: "Starts" }
+                Row {
+                  width: parent.width
+                  spacing: Style.spacing.sm
+                  DateField {
+                    width: editorBody.d.allDay ? parent.width : editorBody.dateWidth
+                    value: editorBody.d.startDate || ""
+                    onPicked: function (key) { root.setDraft("startDate", key) }
+                  }
+                  TimeField {
+                    visible: !editorBody.d.allDay
+                    width: parent.width - editorBody.dateWidth - parent.spacing
+                    value: editorBody.d.startTime || ""
+                    onPicked: function (clock) { root.setDraft("startTime", clock) }
+                  }
+                }
+
+                ZoneField {
+                  visible: !editorBody.d.allDay
+                  width: parent.width
+                  value: editorBody.d.startZone || ""
+                  onPicked: function (zone) { root.setDraft("startZone", zone) }
+                }
+              }
+
+              Column {
+                width: parent.width
+                spacing: Style.space(4)
+                FormLabel { text: "Ends" }
+                Row {
+                  width: parent.width
+                  spacing: Style.spacing.sm
+                  DateField {
+                    width: editorBody.d.allDay ? parent.width : editorBody.dateWidth
+                    value: editorBody.d.endDate || ""
+                    onPicked: function (key) { root.setDraft("endDate", key) }
+                  }
+                  TimeField {
+                    visible: !editorBody.d.allDay
+                    width: parent.width - editorBody.dateWidth - parent.spacing
+                    value: editorBody.d.endTime || ""
+                    onPicked: function (clock) { root.setDraft("endTime", clock) }
+                  }
+                }
+
+                ZoneField {
+                  visible: !editorBody.d.allDay
+                  width: parent.width
+                  value: editorBody.d.endZone || ""
+                  onPicked: function (zone) { root.setDraft("endZone", zone) }
+                }
+              }
+
+              FormRule { }
+
+              PanelSectionHeader { width: parent.width; text: "REPEAT" }
+
+              Column {
+                width: parent.width
+                spacing: Style.space(4)
+                FormLabel { text: "Repeat" }
+                Picker {
+                  width: parent.width
+                  options: root.draft ? Logic.repeatChoices(root.draft) : []
+                  value: editorBody.d.repeat || "none"
+                  onPicked: function (choice) { root.setDraft("repeat", choice) }
+                }
+              }
+
+              // Custom: every how many of what, and on which days. Only
+              // what the start date can be is offered, so a rule never
+              // lands on a day the event is not on.
+              Column {
+                id: customBox
+                visible: editorBody.d.repeat === "custom"
+                width: parent.width
+                spacing: Style.space(4)
+
+                readonly property var rule: editorBody.d.rule || ({})
+
+                FormLabel { text: "Every" }
+                Row {
+                  width: parent.width
+                  spacing: Style.spacing.sm
+
+                  NumberField {
+                    id: intervalField
+                    fieldWidth: Style.space(70)
+                    from: 1
+                    to: 99
+                    value: customBox.rule.interval || 1
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    onModified: function (value) { root.setRule("interval", value) }
+                  }
+
+                  Picker {
+                    width: parent.width - intervalField.width - parent.spacing
+                    options: Logic.freqOptions().map(function (f) {
+                      return { value: f.value,
+                               label: Logic.freqUnit(f.value, customBox.rule.interval) }
+                    })
+                    value: customBox.rule.freq || "WEEKLY"
+                    onPicked: function (choice) { root.setRule("freq", choice) }
+                  }
+                }
+
+                Row {
+                  id: dayRow
+                  visible: customBox.rule.freq === "WEEKLY"
+                  width: parent.width
+                  spacing: Style.space(4)
+                  readonly property var days: customBox.rule.days || []
+
+                  Repeater {
+                    model: Logic.dayToggles(root.weekStartDay)
+
+                    Button {
+                      required property var modelData
+                      width: (dayRow.width - dayRow.spacing * 6) / 7
+                      height: root.controlSize
+                      bordered: true
+                      text: modelData.label
+                      tooltipText: modelData.name
+                      selected: dayRow.days.indexOf(modelData.value) !== -1
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      onClicked: root.toggleRuleDay(modelData.value)
+                    }
+                  }
+                }
+
+                Picker {
+                  visible: customBox.rule.freq === "MONTHLY" || customBox.rule.freq === "YEARLY"
+                  width: parent.width
+                  options: Logic.monthByOptions(editorBody.d.startDate, customBox.rule.freq)
+                  value: customBox.rule.monthBy || "date"
+                  onPicked: function (choice) { root.setRule("monthBy", choice) }
+                }
+              }
+
+              // How it ends, for any rule the form can say — a preset or a
+              // custom one alike. A kept rule keeps its own end.
+              Column {
+                id: endBox
+                visible: editorBody.d.repeat !== "none" && editorBody.d.repeat !== "kept"
+                width: parent.width
+                spacing: Style.space(4)
+
+                readonly property var rule: editorBody.d.rule || ({})
+
+                FormLabel { text: "End repeat" }
+                Row {
+                  width: parent.width
+                  spacing: Style.spacing.sm
+
+                  Picker {
+                    id: endPicker
+                    width: endBox.rule.ends === "never"
+                      ? parent.width : Math.round((parent.width - parent.spacing) * 0.4)
+                    options: Logic.endOptions()
+                    value: endBox.rule.ends || "never"
+                    onPicked: function (choice) { root.setRule("ends", choice) }
+                  }
+
+                  DateField {
+                    visible: endBox.rule.ends === "on"
+                    width: parent.width - endPicker.width - parent.spacing
+                    value: endBox.rule.until || ""
+                    onPicked: function (key) { root.setRule("until", key) }
+                  }
+
+                  Row {
+                    visible: endBox.rule.ends === "after"
+                    spacing: Style.spacing.sm
+
+                    NumberField {
+                      fieldWidth: Style.space(70)
+                      from: 1
+                      to: 999
+                      value: endBox.rule.count || 1
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      onModified: function (value) { root.setRule("count", value) }
+                    }
+
+                    Text {
+                      anchors.verticalCenter: parent.verticalCenter
+                      textFormat: Text.PlainText
+                      text: (endBox.rule.count || 1) === 1 ? "time" : "times"
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                    }
+                  }
+                }
+
+                // The rule read back in words, so what will be kept is
+                // what the person sees before saving it.
+                Text {
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                  textFormat: Text.PlainText
+                  text: root.draft ? Logic.ruleSummary(root.draft) : ""
+                  color: root.subdued
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              FormRule { }
+
+              PanelSectionHeader { width: parent.width; text: "LOCATION" }
+
+              Column {
+                width: parent.width
+                spacing: Style.space(4)
+                FormLabel { text: "Address" }
+                // iCloud stores an address on several lines, and they go
+                // back on the lines they came on — so a box that can hold
+                // them, starting at one.
+                // The address, and what it might be, in a dropdown under it
+                // the way a Picker drops its list: the calendar's own
+                // addresses first, then the lookup service's, if one is on.
+                // It never takes focus from the field, so typing goes on.
+                Item {
+                  id: addressBox
+                  width: parent.width
+                  height: addressField.height
+
+                  readonly property bool wanted: root.placeQuery.trim().length >= 2
+                    && (root.placeMatches.length > 0 || root.placesProvider !== "none")
+                  onWantedChanged: wanted ? placePop.open() : placePop.close()
+
+                  NoteField {
+                    id: addressField
+                    width: parent.width
+                    minLines: 1
+                    Keys.onPressed: function (event) {
+                      if (!placePop.opened) return
+                      var list = root.placeMatches.concat(root.placeLookups)
+                      root.placeCurrent = root.suggestKey(event, list.length, root.placeCurrent,
+                        function (i) { root.pickPlace(list[i]) })
+                      // Enter on nothing chosen asks Nominatim, when it is the one on.
+                      if (!event.accepted && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
+                          && root.placesProvider === "nominatim" && root.placeQuery.trim().length >= 3) {
+                        root.searchNominatim()
+                        event.accepted = true
+                      }
+                    }
+                    text: editorBody.d.location || ""
+                    onTextChanged: {
+                      if (!root.draft || text === root.draft.location) return
+                      root.setDraft("location", text)
+                      // Only what the person types starts suggestions, not the
+                      // form filling itself in.
+                      if (activeFocus) root.typePlace(text)
+                    }
+                  }
+
+                  SuggestMenu {
+                    id: placePop
+                    anchor: addressBox
+                    width: addressBox.width
+                    // Clicked away from: the suggestions are done with.
+                    onClosed: if (addressBox.wanted) root.placeQuery = ""
+
+                    // Addresses run long, so each wraps in full, and a rule
+                    // between them keeps where one ends and the next begins.
+                    Repeater {
+                      model: root.placeMatches
+                      Column {
+                        required property var modelData
+                        required property int index
+                        width: placePop.availableWidth
+                        spacing: Style.spacing.labelGap
+
+                        Rule { visible: index > 0; width: parent.width }
+
+                        MenuRow {
+                          width: parent.width
+                          wrap: true
+                          highlighted: parent.index === root.placeCurrent
+                          label: Logic.singleLine(modelData.text)
+                          onActivated: root.pickPlace(modelData)
+                        }
+                      }
+                    }
+
+                    // Nominatim only searches when asked; its rules forbid
+                    // suggesting as you type. The ask is a row like the rest.
+                    MenuRow {
+                      visible: root.placesProvider === "nominatim"
+                        && root.placeQuery.trim().length >= 3
+                        && !(root.service && root.service.placesSearching)
+                      width: placePop.availableWidth
+                      label: "Search OpenStreetMap"
+                      note: root.nominatimResting ? "a moment\u2026" : ""
+                      onActivated: root.searchNominatim()
+                    }
+
+                    Repeater {
+                      model: root.placeLookups
+                      Column {
+                        required property var modelData
+                        required property int index
+                        width: placePop.availableWidth
+                        spacing: Style.spacing.labelGap
+
+                        // Ruled off from the calendar's own suggestions too.
+                        Rule {
+                          visible: index > 0 || root.placeMatches.length > 0
+                          width: parent.width
+                        }
+
+                        MenuRow {
+                          width: parent.width
+                          wrap: true
+                          highlighted: parent.index + root.placeMatches.length === root.placeCurrent
+                          label: Logic.singleLine(modelData.text)
+                          onActivated: root.pickPlace(modelData)
+                        }
+                      }
+                    }
+
+                    MenuCaption {
+                      visible: !!root.service && root.service.placesSearching
+                      width: placePop.availableWidth
+                      text: "Searching\u2026"
+                    }
+
+                    MenuCaption {
+                      visible: !!root.service && root.service.placesError !== ""
+                      width: placePop.availableWidth
+                      text: root.service ? root.service.placesError : ""
+                      color: root.danger
+                    }
+
+                    // OpenStreetMap's licence asks for this wherever its
+                    // data is shown.
+                    MenuCaption {
+                      visible: root.placeLookups.length > 0
+                      width: placePop.availableWidth
+                      text: "\u00a9 OpenStreetMap contributors"
+                    }
+                  }
+                }
+              }
+
+              // A video call or dial-in, kept in its own field (RFC 7986
+              // CONFERENCE) rather than in the event's URL, so an event can
+              // have both. The viewer offers to join it.
+              Column {
+                width: parent.width
+                spacing: Style.space(4)
+                FormLabel { text: "Video call or conference" }
+                TextField {
+                  width: parent.width
+                  height: root.fieldHeight
+                  text: editorBody.d.conference || ""
+                  placeholderText: "https://zoom.us/j/\u2026"
+                  foreground: root.foreground
+                  onTextEdited: root.setDraft("conference", text)
+                }
+              }
+
+              FormRule { }
+
+              PanelSectionHeader { width: parent.width; text: "INVITEES" }
+
+              // Who is invited, and how they answered. Only the organiser
+              // can change the list; anyone else sees it and why.
+              Column {
+                width: parent.width
+                spacing: Style.space(4)
+
+                Repeater {
+                  model: editorBody.d.invitees || []
+
+                  Item {
+                    required property var modelData
+                    width: editorBody.width
+                    height: Math.max(inviteeLines.implicitHeight, root.controlSize)
+
+                    Column {
+                      id: inviteeLines
+                      anchors.left: parent.left
+                      anchors.right: removeInviteeButton.left
+                      anchors.rightMargin: Style.space(6)
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(1)
+
+                      Text {
+                        width: parent.width
+                        elide: Text.ElideRight
+                        textFormat: Text.PlainText
+                        text: modelData.name || modelData.email
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                      }
+
+                      Text {
+                        width: parent.width
+                        elide: Text.ElideRight
+                        textFormat: Text.PlainText
+                        text: (modelData.name ? modelData.email + " \u00b7 " : "")
+                            + Logic.inviteeStatus(modelData.status)
+                        color: root.subdued
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+
+                    Button {
+                      id: removeInviteeButton
+                      visible: root.canInviteHere
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      width: root.controlSize
+                      height: root.controlSize
+                      bordered: true
+                      iconText: "\uf00d"
+                      tooltipText: "Remove " + (modelData.name || modelData.email)
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      onClicked: root.removeInvitee(modelData.email)
+                    }
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  visible: !root.canInviteHere
+                  wrapMode: Text.WordWrap
+                  textFormat: Text.PlainText
+                  text: "Only " + (root.draftBase && root.draftBase.organizer
+                    ? root.draftBase.organizer : "the organiser")
+                    + " can change who\u2019s invited."
+                  color: root.subdued
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                // The address being typed, and the contacts it could be in a
+                // dropdown under it, the same as the address field's.
+                Item {
+                  id: inviteeBox
+                  visible: root.canInviteHere
+                  width: parent.width
+                  height: inviteeRow.height
+
+                  readonly property bool wanted: root.canInviteHere
+                    && root.inviteeSuggestions.length > 0 && !root.inviteeDismissed
+                  onWantedChanged: wanted ? inviteePop.open() : inviteePop.close()
+
+                  Row {
+                    id: inviteeRow
+                    width: parent.width
+                    spacing: Style.spacing.sm
+
+                    TextField {
+                      id: inviteeField
+                      width: parent.width - addInviteeButton.width - parent.spacing
+                      height: root.fieldHeight
+                      text: root.inviteeText
+                      placeholderText: "Add by email"
+                      foreground: root.foreground
+                      onTextEdited: { root.inviteeText = text; root.inviteeDismissed = false }
+                      onAccepted: root.addInvitee(root.inviteeText, "")
+                      Keys.onPressed: function (event) {
+                        if (!inviteePop.opened) return
+                        var list = root.inviteeSuggestions
+                        root.inviteeCurrent = root.suggestKey(event, list.length, root.inviteeCurrent,
+                          function (i) { root.addInvitee(list[i].email, list[i].name) })
+                      }
+                    }
+
+                    Button {
+                      id: addInviteeButton
+                      width: root.controlSize
+                      height: root.fieldHeight
+                      bordered: true
+                      iconText: "\uf067"
+                      tooltipText: "Add invitee"
+                      enabled: root.inviteeText.trim() !== "" && root.inviteeProblem === ""
+                      opacity: enabled ? 1.0 : 0.4
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      onClicked: root.addInvitee(root.inviteeText, "")
+                    }
+                  }
+
+                  SuggestMenu {
+                    id: inviteePop
+                    anchor: inviteeBox
+                    width: inviteeBox.width
+                    // Clicked away from: stays shut until the address changes.
+                    onClosed: if (inviteeBox.wanted) root.inviteeDismissed = true
+
+                    Repeater {
+                      model: root.inviteeSuggestions
+                      MenuRow {
+                        required property var modelData
+                        required property int index
+                        highlighted: index === root.inviteeCurrent
+                        width: inviteePop.availableWidth
+                        label: modelData.name || modelData.email
+                        note: modelData.name ? modelData.email : ""
+                        onActivated: root.addInvitee(modelData.email, modelData.name)
+                      }
+                    }
+                  }
+                }
+
+                // Said as it is typed, once there is enough to judge.
+                Text {
+                  width: parent.width
+                  visible: root.canInviteHere && root.inviteeProblem !== ""
+                    && (root.inviteeText.indexOf("@") !== -1 || root.inviteeTried)
+                  wrapMode: Text.WordWrap
+                  textFormat: Text.PlainText
+                  text: root.inviteeProblem
+                  color: root.danger
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                // The way to suggestions, for someone who has not turned
+                // them on. It asks; it does not switch anything by itself.
+                // Bordered like every other button on the card, so its box
+                // is the edge the section ends on rather than empty padding.
+                Button {
+                  visible: root.canInviteHere && !!root.service && !root.service.contactsEnabled
+                  width: parent.width
+                  height: root.controlSize
+                  bordered: true
+                  iconText: "\uf2bb"
+                  text: "Suggest from iCloud Contacts\u2026"
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: root.consentKind = "contacts"
+                }
+              }
+
+              FormRule { }
+
+              PanelSectionHeader { width: parent.width; text: "OPTIONS" }
+
+              Column {
+                width: parent.width
+                spacing: Style.space(4)
+                FormLabel { text: "Alert" }
+                Picker {
+                  width: parent.width
+                  options: root.draft ? Logic.alertChoices(root.draft, 0) : []
+                  value: editorBody.d.alerts ? editorBody.d.alerts[0] : "none"
+                  onPicked: function (choice) { root.setAlert(0, choice) }
+                }
+              }
+
+              // A second only once there is a first, the way a phone offers
+              // it — or if the event already has one.
+              Column {
+                visible: !!editorBody.d.alerts
+                  && (editorBody.d.alerts[0] !== "none" || editorBody.d.alerts[1] !== "none")
+                width: parent.width
+                spacing: Style.space(4)
+                FormLabel { text: "Second alert" }
+                Picker {
+                  width: parent.width
+                  options: root.draft ? Logic.alertChoices(root.draft, 1) : []
+                  value: editorBody.d.alerts ? editorBody.d.alerts[1] : "none"
+                  onPicked: function (choice) { root.setAlert(1, choice) }
+                }
+              }
+
+              // Blocked out before the event, as Apple does. None for an
+              // all-day event, which Apple does not give one.
+              Column {
+                visible: !editorBody.d.allDay
+                width: parent.width
+                spacing: Style.space(4)
+                FormLabel { text: "Travel time" }
+                Picker {
+                  width: parent.width
+                  options: root.draft ? Logic.travelChoices(root.draft) : []
+                  value: editorBody.d.travel || "0"
+                  onPicked: function (choice) { root.setDraft("travel", choice) }
+                }
+              }
+
+              FormRule { }
+
+              PanelSectionHeader { width: parent.width; text: "DETAILS" }
+
+              Column {
+                width: parent.width
+                spacing: Style.space(4)
+                FormLabel { text: "Notes" }
+                NoteField {
+                  width: parent.width
+                  text: editorBody.d.notes || ""
+                  onTextChanged: if (root.draft && text !== root.draft.notes)
+                    root.setDraft("notes", text)
+                }
+              }
+
+              // Files on the event, each removable, and a way to pick more.
+              Column {
+                width: parent.width
+                spacing: Style.space(4)
+                FormLabel { text: "Attachments" }
+
+                Button {
+                  width: parent.width
+                  height: root.controlSize
+                  bordered: true
+                  iconText: "\uf0c6"
+                  text: "Add file\u2026"
+                  // Twenty is iCloud's most for one event.
+                  enabled: !editorBody.d.attachments
+                    || editorBody.d.attachments.length < 20
+                  opacity: enabled ? 1.0 : 0.4
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: root.pickAttachment()
+                }
+
+                Repeater {
+                  model: editorBody.d.attachments || []
+
+                  Item {
+                    required property var modelData
+                    required property int index
+                    width: editorBody.width
+                    height: root.controlSize
+
+                    Text {
+                      anchors.left: parent.left
+                      anchors.right: removeAttachmentButton.left
+                      anchors.rightMargin: Style.space(6)
+                      anchors.verticalCenter: parent.verticalCenter
+                      elide: Text.ElideMiddle
+                      textFormat: Text.PlainText
+                      text: Logic.attachmentLabel(modelData)
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                    }
+
+                    Button {
+                      id: removeAttachmentButton
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      width: root.controlSize
+                      height: root.controlSize
+                      bordered: true
+                      iconText: "\uf00d"
+                      tooltipText: "Remove " + modelData.name
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      onClicked: root.removeAttachment(index)
+                    }
+                  }
+                }
+
+                // "None", or how much of iCloud's allowance is used.
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: Logic.attachmentSummary(editorBody.d.attachments || [])
+                  color: root.subdued
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Text {
+                  width: parent.width
+                  visible: root.attachError !== ""
+                  wrapMode: Text.WordWrap
+                  textFormat: Text.PlainText
+                  text: root.attachError
+                  color: root.danger
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              Column {
+                width: parent.width
+                spacing: Style.space(4)
+                FormLabel { text: "URL" }
+                TextField {
+                  width: parent.width
+                  height: root.fieldHeight
+                  text: editorBody.d.url || ""
+                  placeholderText: "https://"
+                  foreground: root.foreground
+                  onTextEdited: root.setDraft("url", text)
+                }
+              }
+
+            }
+          }
+
+          // Pinned to the foot of the column, under whatever scrolls above:
+          // Edit and Delete while reading an event, Save and Cancel while
+          // changing one. The same foot the calendar list keeps its Add on.
+          Column {
+            id: dayFoot
+            visible: root.viewerOpen
+            anchors.bottom: parent.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            spacing: Style.spacing.md
+
+            // Why Save is not lit, said where Save is.
+            Text {
+              width: parent.width
+              // Not on a new event nobody has touched yet: a blank form is
+              // not a mistake, and Save being off already says so.
+              visible: root.editorOpen && root.draftProblem !== ""
+                && !(root.creating && root.draftChanges.length === 0)
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              text: root.draftProblem
+              color: root.danger
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            // And why Edit and Delete are not, once the event has loaded.
+            Text {
+              width: parent.width
+              visible: !root.editorOpen && !!root.viewerEvent
+                && !!root.viewerEvent.readonly
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              text: "This calendar is shared read-only, so its events can\u2019t be changed here."
+              color: root.subdued
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              width: parent.width
+              visible: root.editNotice !== ""
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              text: root.editNotice
+              color: root.editNoticeBad ? root.danger : root.subdued
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Rule { width: parent.width }
+
+            Item { width: 1; height: Math.max(0, root.ruleGap - Style.spacing.md * 2) }
+
+            Row {
+              visible: !root.editorOpen
+              width: parent.width
+              spacing: Style.spacing.md
+
+              Button {
+                width: (parent.width - Style.spacing.md * 2 - root.controlSize) / 2
+                height: root.controlSize
+                bordered: true
+                iconText: "\uf040"
+                text: "Edit"
+                enabled: root.viewerEditable
+                opacity: enabled ? 1.0 : 0.4
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: root.startEdit()
+              }
+
+              // A copy, as a new event: open as soon as the event's detail
+              // is in, and whatever calendar it is in — a read-only one's
+              // events can still be copied into a calendar of one's own.
+              Button {
+                width: (parent.width - Style.spacing.md * 2 - root.controlSize) / 2
+                height: root.controlSize
+                bordered: true
+                iconText: "\uf0c5"
+                text: "Duplicate"
+                enabled: root.viewerLoaded && root.newEventCalendar !== ""
+                  && !(root.service && root.service.writing)
+                opacity: enabled ? 1.0 : 0.4
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: root.startDuplicate()
+              }
+
+              // Square, a glyph and its tooltip: the one action here that
+              // asks before it does anything, so it can spare its label to
+              // give Edit and Duplicate room for theirs.
+              Button {
+                width: root.controlSize
+                height: root.controlSize
+                bordered: true
+                iconText: "\uf1f8"
+                tooltipText: "Delete event"
+                enabled: root.viewerEditable && !(root.service && root.service.writing)
+                opacity: enabled ? 1.0 : 0.4
+                foreground: root.danger
+                fontFamily: root.fontFamily
+                onClicked: root.requestDelete()
+              }
+            }
+
+            Row {
+              visible: root.editorOpen
+              width: parent.width
+              spacing: Style.spacing.md
+
+              Button {
+                width: (parent.width - Style.spacing.md) / 2
+                height: root.controlSize
+                bordered: true
+                iconText: "\uf00c"
+                text: root.service && root.service.writing ? "Saving\u2026" : "Save"
+                // Nothing to save until something has changed, and nothing
+                // that would not survive being saved.
+                enabled: !(root.service && root.service.writing)
+                  && (root.creating || root.draftChanges.length > 0)
+                  && root.draftProblem === ""
+                opacity: enabled ? 1.0 : 0.4
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: root.requestSave()
+              }
+
+              Button {
+                width: (parent.width - Style.spacing.md) / 2
+                height: root.controlSize
+                bordered: true
+                iconText: "\uf00d"
+                text: "Cancel"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: root.requestCancel(null)
+              }
             }
           }
 
@@ -4514,6 +6768,223 @@ Panel {
               foreground: root.foreground
               fontFamily: root.fontFamily
               onClicked: root.pendingForget = null
+            }
+          }
+        }
+      }
+    }
+
+    // The question a save or a delete asks before it goes: yes or no for a
+    // delete, and for anything in a series, how far it reaches. The same
+    // shape as the calendar question above it, answered by clicking away
+    // or with Escape the same way.
+    Rectangle {
+      id: actionModal
+      anchors.fill: parent
+      z: 2
+      visible: root.pendingAction !== ""
+      color: Util.alpha(Color.popups.background, 0.88)
+
+      readonly property bool deleting: root.pendingAction === "delete"
+      readonly property bool discarding: root.pendingAction === "discard"
+
+      MouseArea {
+        anchors.fill: parent
+        onClicked: root.dismissAction()
+      }
+
+      BorderSurface {
+        anchors.centerIn: parent
+        width: Math.min(Style.space(420), parent.width - root.ruleGap * 2)
+        height: actionBody.implicitHeight + root.ruleGap * 2
+        radius: Style.cornerRadius
+        color: Color.popups.background
+        borderSpec: Border.controlSpec("normal", root.foreground, Color.accent)
+
+        MouseArea { anchors.fill: parent }
+
+        Column {
+          id: actionBody
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          anchors.margins: root.ruleGap
+          spacing: Style.spacing.md
+
+          ColumnHeader {
+            width: parent.width
+            title: root.viewerEvent ? Logic.singleLine(root.viewerEvent.title)
+              : root.draft ? (Logic.singleLine(root.draft.title) || "New event") : ""
+            meta: actionModal.deleting ? "Delete event"
+              : actionModal.discarding ? "Unsaved changes" : "Save changes"
+          }
+
+          Item { width: 1; height: Math.max(0, root.ruleGap - Style.spacing.md * 2) }
+
+          Rule { width: parent.width }
+
+          Item { width: 1; height: Math.max(0, root.ruleGap - Style.spacing.md * 2) }
+
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            text: Logic.actionPrompt(root.pendingAction, root.pendingScopes, root.draftChanges)
+            color: root.subdued
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Item { width: 1; height: Math.max(0, root.ruleGap - Style.spacing.md * 2) }
+
+          // A one-off delete: the same pair the calendar question has.
+          Row {
+            visible: root.pendingScopes.length === 0
+            width: parent.width
+            spacing: Style.spacing.md
+
+            Button {
+              width: (parent.width - Style.spacing.md) / 2
+              height: root.controlSize
+              bordered: true
+              iconText: "\uf1f8"
+              text: actionModal.discarding ? "Discard changes" : "Yes, delete"
+              foreground: root.danger
+              fontFamily: root.fontFamily
+              onClicked: root.finishAction(root.pendingAction, "")
+            }
+
+            Button {
+              width: (parent.width - Style.spacing.md) / 2
+              height: root.controlSize
+              bordered: true
+              iconText: actionModal.discarding ? "\uf040" : "\uf00d"
+              text: actionModal.discarding ? "Keep editing" : "No, cancel"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: root.dismissAction()
+            }
+          }
+
+          // A series: one button per answer, each saying exactly what it
+          // reaches, and a way out under them.
+          Repeater {
+            model: root.pendingScopes
+
+            Button {
+              required property var modelData
+              width: actionBody.width
+              height: root.controlSize
+              bordered: true
+              iconText: actionModal.deleting ? "\uf1f8" : "\uf00c"
+              text: modelData.label
+              foreground: actionModal.deleting ? root.danger : root.foreground
+              fontFamily: root.fontFamily
+              onClicked: root.finishAction(root.pendingAction, modelData.value)
+            }
+          }
+
+          Button {
+            visible: root.pendingScopes.length > 0
+            width: parent.width
+            height: root.controlSize
+            bordered: true
+            iconText: "\uf00d"
+            text: "Cancel"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: root.dismissAction()
+          }
+        }
+      }
+    }
+
+    // Anything that leaves the machine is asked for plainly, once, before
+    // any of it happens: what is read or sent, where it goes, and how to
+    // undo it. Contacts and address lookups share the one question.
+    Rectangle {
+      id: consentModal
+      anchors.fill: parent
+      z: 3
+      visible: root.consentKind !== ""
+      color: Util.alpha(Color.popups.background, 0.88)
+
+      // Clicking away is the same answer as Don't allow.
+      MouseArea {
+        anchors.fill: parent
+        onClicked: root.consentKind = ""
+      }
+
+      BorderSurface {
+        anchors.centerIn: parent
+        width: Math.min(Style.space(420), parent.width - root.ruleGap * 2)
+        height: contactsBody.implicitHeight + root.ruleGap * 2
+        radius: Style.cornerRadius
+        color: Color.popups.background
+        borderSpec: Border.controlSpec("normal", root.foreground, Color.accent)
+
+        MouseArea { anchors.fill: parent }
+
+        Column {
+          id: contactsBody
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          anchors.margins: root.ruleGap
+          spacing: Style.spacing.md
+
+          ColumnHeader {
+            width: parent.width
+            title: root.consentKind === "contacts" ? "iCloud Contacts"
+                 : root.consentKind === "nominatim" ? "Nominatim" : "Photon"
+            meta: root.consentKind === "contacts" ? "Allow access?" : "Send addresses?"
+          }
+
+          Item { width: 1; height: Math.max(0, root.ruleGap - Style.spacing.md * 2) }
+
+          Rule { width: parent.width }
+
+          Item { width: 1; height: Math.max(0, root.ruleGap - Style.spacing.md * 2) }
+
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            text: root.consentKind === "contacts" ? Logic.contactsPermissionText()
+                : Logic.placesPermissionText(root.consentKind)
+            color: root.subdued
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Item { width: 1; height: Math.max(0, root.ruleGap - Style.spacing.md * 2) }
+
+          Row {
+            width: parent.width
+            spacing: Style.spacing.md
+
+            Button {
+              width: (parent.width - Style.spacing.md) / 2
+              height: root.controlSize
+              bordered: true
+              iconText: "\uf00c"
+              text: "Allow"
+              // Green for yes and red for no, so the answer reads before
+              // the label does.
+              foreground: root.stored
+              fontFamily: root.fontFamily
+              onClicked: root.allowConsent()
+            }
+
+            Button {
+              width: (parent.width - Style.spacing.md) / 2
+              height: root.controlSize
+              bordered: true
+              iconText: "\uf00d"
+              text: "Don\u2019t allow"
+              foreground: root.danger
+              fontFamily: root.fontFamily
+              onClicked: root.consentKind = ""
             }
           }
         }

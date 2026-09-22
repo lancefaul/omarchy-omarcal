@@ -21,6 +21,12 @@ output=$(python3 -B -m unittest discover -s tests/helper -p 'test_*.py' 2>&1 | g
 tail -n 1 <<<"$output"
 grep -qE '^OK' <<<"$(tail -n 1 <<<"$output")" || { echo "$output"; status=1; }
 
+# Checks on the QML source itself that the QML engine does not make.
+printf '\n== tests/lint\n'
+output=$(python3 -B -m unittest discover -s tests/lint -p 'test_*.py' 2>&1)
+tail -n 1 <<<"$output"
+grep -qE '^OK' <<<"$(tail -n 1 <<<"$output")" || { echo "$output"; status=1; }
+
 printf '\n'
 [ $status -eq 0 ] && echo "all suites passed" || echo "FAILURES"
 exit $status

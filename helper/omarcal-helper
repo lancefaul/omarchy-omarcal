@@ -38,8 +38,10 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 from xml.etree import ElementTree as ET
 
@@ -48,14 +50,23 @@ import gi
 gi.require_version("ICalGLib", "4.0")
 from gi.repository import ICalGLib as ICal  # noqa: E402
 
+# Keep parameters libical does not know. Its default discards them, and
+# Apple writes some — ROUTING=CAR on a travel-time start — that a save would
+# otherwise quietly strip from an event it only meant to retitle.
+ICal.set_unknown_token_handling_setting(ICal.Unknowntokenhandling.ASSUME_IANA_TOKEN)
+
 NS = {
     "d": "DAV:",
     "c": "urn:ietf:params:xml:ns:caldav",
     "cs": "http://calendarserver.org/ns/",
     "a": "http://apple.com/ns/ical/",
+    "card": "urn:ietf:params:xml:ns:carddav",
 }
 
 ICLOUD = "https://caldav.icloud.com/"
+# The same account's contacts, over CardDAV. Only ever read, and only once
+# the person has switched contacts on — see `contacts-sync`.
+ICLOUD_CONTACTS = "https://contacts.icloud.com/"
 
 REQUEST_TIMEOUT = 45.0
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
@@ -122,6 +133,16 @@ DEFAULT_SETTINGS = {
     # which is midnight of the next day.
     "dayStartHour": 0,
     "dayEndHour": 24,
+    # Suggesting invitees from iCloud Contacts. Off until the person says
+    # yes to reading them, in so many words; off again deletes them.
+    "contactsEnabled": False,
+    # Where an address is looked up beyond the calendar's own history:
+    # "none", "photon" or "nominatim". Anything but "none" sends what is
+    # typed to that service, so it is asked about before it is set.
+    "placesProvider": "none",
+    # The calendar a new event is added to, by URL. Empty means the
+    # writable calendar with the most events.
+    "defaultCalendar": "",
 }
 
 
@@ -390,6 +411,40 @@ CREATE INDEX IF NOT EXISTS objects_calendar ON objects(calendar);
 CREATE INDEX IF NOT EXISTS objects_span ON objects(open_ended, last_end, first_start);
 CREATE INDEX IF NOT EXISTS objects_uid ON objects(uid);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+-- Saves and deletes made while iCloud could not be reached, in the order
+-- they were made. `state` is queued, or conflict once one could not be sent.
+CREATE TABLE IF NOT EXISTS pending (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    action  TEXT NOT NULL,
+    request TEXT NOT NULL,
+    title   TEXT NOT NULL DEFAULT '',
+    created INTEGER NOT NULL DEFAULT 0,
+    state   TEXT NOT NULL DEFAULT 'queued',
+    error   TEXT NOT NULL DEFAULT ''
+);
+-- What each queued change replaced in the cache, so it can be replayed on
+-- iCloud's own version and undone from the display if it cannot be sent.
+CREATE TABLE IF NOT EXISTS pending_backup (
+    pending_id INTEGER NOT NULL,
+    url        TEXT NOT NULL,
+    existed    INTEGER NOT NULL,
+    calendar   TEXT NOT NULL DEFAULT '',
+    etag       TEXT NOT NULL DEFAULT '',
+    ics        TEXT NOT NULL DEFAULT ''
+);
+-- A name and an address per row, and nothing else from the card: that is
+-- all an invitee suggestion needs, and all the person agreed to keep.
+CREATE TABLE IF NOT EXISTS contacts (
+    account TEXT NOT NULL,
+    name    TEXT NOT NULL DEFAULT '',
+    email   TEXT NOT NULL,
+    PRIMARY KEY (account, email)
+);
+CREATE TABLE IF NOT EXISTS contact_state (
+    account   TEXT PRIMARY KEY,
+    synced_at INTEGER NOT NULL DEFAULT 0,
+    error     TEXT NOT NULL DEFAULT ''
+);
 """
 
 
@@ -426,6 +481,10 @@ def db() -> sqlite3.Connection:
     have = {r[1] for r in conn.execute("PRAGMA table_info(calendars)")}
     if "account" not in have:
         conn.execute("ALTER TABLE calendars ADD COLUMN account TEXT NOT NULL DEFAULT ''")
+    # 1 while an object is a change of ours not yet on iCloud.
+    have = {r[1] for r in conn.execute("PRAGMA table_info(objects)")}
+    if "pending" not in have:
+        conn.execute("ALTER TABLE objects ADD COLUMN pending INTEGER NOT NULL DEFAULT 0")
     migrate(conn)
     return conn
 
@@ -554,6 +613,9 @@ def fetch_calendar(session: DavSession, cal: dict, known: dict[str, str],
 def sync(conn, only: str = "", force: bool = False) -> dict:
     started = time.monotonic()
     results = []
+    # What was saved while offline goes before anything is fetched, so the
+    # fetch brings back iCloud's answer to it.
+    flushed = flush_pending(conn) if queued_count(conn) else {"sent": 0}
 
     # Each account is discovered and pulled on its own, so one that is down
     # or whose password was revoked does not stop the others.
@@ -568,6 +630,7 @@ def sync(conn, only: str = "", force: bool = False) -> dict:
     conn.commit()
     return {
         "ok": True,
+        "flushed": flushed,
         "calendars": [
             {k: v for k, v in outcome.items() if k not in ("rows", "removed")}
             for outcome in results
@@ -819,10 +882,16 @@ def meeting_link(*fields: str) -> tuple[str, str]:
 
 
 def base_fields(comp, cal: dict) -> dict:
-    description = property_text(comp, ICal.PropertyKind.DESCRIPTION_PROPERTY)
+    description = comp.get_description() or ""
     location = comp.get_location() or ""
     url = property_text(comp, ICal.PropertyKind.URL_PROPERTY)
-    link, kind = meeting_link(url, location, description)
+    # RFC 7986's own place for a video call or dial-in. Read first, and
+    # offered as the meeting even when it is no service the patterns know —
+    # a FaceTime link or a tel: dial-in is still how to join.
+    conference = property_text(comp, ICal.PropertyKind.CONFERENCE_PROPERTY)
+    link, kind = meeting_link(conference, url, location, description)
+    if not link and conference:
+        link, kind = conference, "conference"
     return {
         "uid": comp.get_uid() or "",
         "title": comp.get_summary() or "",
@@ -832,6 +901,7 @@ def base_fields(comp, cal: dict) -> dict:
         "color": cal.get("color", ""),
         "meetingUrl": link,
         "meetingKind": kind,
+        "conference": conference,
     }
 
 
@@ -932,7 +1002,7 @@ def visible_calendars(conn) -> dict[str, dict]:
 
 def window_rows(conn, start: datetime, end: datetime, calendars: list[str]):
     sql = (
-        "SELECT calendar, ics FROM objects "
+        "SELECT calendar, ics, pending FROM objects "
         "WHERE (open_ended=1 OR (last_end >= ? AND first_start < ?))"
     )
     args: list = [int(start.timestamp()), int(end.timestamp())]
@@ -958,8 +1028,13 @@ def events(conn, start: datetime, end: datetime, only: list[str]) -> dict:
         }
     out: list = []
     parsed = 0
-    for calendar, ics in window_rows(conn, start, end, wanted):
+    for calendar, ics, pending in window_rows(conn, start, end, wanted):
+        before = len(out)
         expand(ics, cals.get(calendar, {}), start, end, out)
+        # A change of ours still waiting for iCloud: shown, and marked.
+        if pending:
+            for item in out[before:]:
+                item["pending"] = True
         parsed += 1
     # By day, all-day first (they head the band in every view), then by time.
     out.sort(key=lambda e: (e["start"][:10], not e["allDay"], e["start"]))
@@ -971,7 +1046,135 @@ def events(conn, start: datetime, end: datetime, only: list[str]) -> dict:
     }
 
 
-def event_detail(conn, uid: str, rid: str) -> dict:
+def strip_mailto(value: str) -> str:
+    # Any case: some servers write MAILTO:, and an organiser read with its
+    # scheme still on never matches the account it belongs to.
+    return re.sub(r"(?i)^mailto:", "", (value or "").strip())
+
+
+def organizer_of(comp) -> str:
+    """The organiser's address. iCloud rewrites a mailto: ORGANIZER into its
+    own principal path on save and keeps the address in an EMAIL parameter
+    (seen 2026-09-21), so that is read first — without it an event's own
+    organiser would not be recognised as the account, and could no longer
+    change who is invited."""
+    prop = comp.get_first_property(ICal.PropertyKind.ORGANIZER_PROPERTY)
+    if prop is None:
+        return ""
+    email = (prop.get_parameter_as_string("EMAIL") or "").strip()
+    return email or strip_mailto(prop.get_value_as_string() or "")
+
+
+def x_property(comp, name: str) -> str:
+    """The value of an X- property, which ICalGLib keeps by its own name."""
+    prop = comp.get_first_property(ICal.PropertyKind.X_PROPERTY)
+    while prop is not None:
+        if (prop.get_x_name() or "").upper() == name:
+            return (prop.get_value_as_string() or "").strip()
+        prop = comp.get_next_property(ICal.PropertyKind.X_PROPERTY)
+    return ""
+
+
+def place_of(comp) -> dict | None:
+    """The point Apple stored for the event's location, if it stored one."""
+    prop = comp.get_first_property(ICal.PropertyKind.X_PROPERTY)
+    while prop is not None:
+        if (prop.get_x_name() or "").upper() == "X-APPLE-STRUCTURED-LOCATION":
+            return structured_place(prop.as_ical_string().strip())
+        prop = comp.get_next_property(ICal.PropertyKind.X_PROPERTY)
+    return None
+
+
+def attachments_of(comp) -> list[dict]:
+    """The event's own attachments — not its alarms' sounds, which are
+    ATTACH lines too but live inside each VALARM.
+
+    iCloud uploads (RFC 8607) carry MANAGED-ID, FILENAME and SIZE. Files
+    that arrived with an emailed invitation carry X-APPLE-FILENAME and a
+    CID: reference to a mail part this cache never sees. An inline
+    VALUE=BINARY attachment is named but its content is not handed on.
+    """
+    out = []
+    prop = comp.get_first_property(ICal.PropertyKind.ATTACH_PROPERTY)
+    while prop is not None:
+        def param(name: str) -> str:
+            return (prop.get_parameter_as_string(name) or "").strip()
+        inline = param("VALUE").upper() == "BINARY" or param("ENCODING").upper() == "BASE64"
+        value = "" if inline else (prop.get_value_as_string() or "").strip()
+        name = param("FILENAME") or param("X-APPLE-FILENAME") or param("X-FILENAME")
+        if not name and value.lower().startswith("http"):
+            name = value.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+        try:
+            size = int(param("SIZE") or 0)
+        except ValueError:
+            size = 0
+        out.append({
+            "name": name or "Attachment",
+            "size": size,
+            "type": param("FMTTYPE"),
+            "managedId": param("MANAGED-ID"),
+            # Only a URL something could fetch; a CID: points into an email.
+            "url": value if value.lower().startswith("https://") else "",
+        })
+        prop = comp.get_next_property(ICal.PropertyKind.ATTACH_PROPERTY)
+    return out
+
+
+def zone_list() -> list[dict]:
+    """Every place-named zone, with its offset from UTC today in minutes —
+    what a picker needs to show "Tokyo (UTC+9)". Aliases kept for old
+    software (US/…, Etc/…, posix/…) are left out."""
+    from zoneinfo import available_timezones
+    now = datetime.now(timezone.utc)
+    out = []
+    for name in sorted(available_timezones()):
+        if "/" not in name or name.split("/")[0] in (
+                "Etc", "SystemV", "US", "posix", "right", "Brazil", "Canada", "Chile", "Mexico"):
+            continue
+        try:
+            offset = now.astimezone(ZoneInfo(name)).utcoffset()
+        except Exception:
+            continue
+        out.append({"name": name, "offset": int(offset.total_seconds() // 60)})
+    return out
+
+
+def until_date(rule: str) -> str:
+    match = re.search(r"UNTIL=(\d{8})(?:T(\d{6})(Z?))?", rule or "")
+    if not match:
+        return ""
+    day = match.group(1)
+    if not match.group(2) or not match.group(3):
+        return f"{day[:4]}-{day[4:6]}-{day[6:]}"
+    moment = datetime.strptime(day + match.group(2), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    return moment.astimezone(LOCAL_TZ).strftime("%Y-%m-%d")
+
+
+def zone_of(parsed, comp, kind) -> str:
+    """The zone a DTSTART or DTEND is written in: its TZID, "UTC" for a Z
+    time, or "" for a date or a floating time, which belong to no zone."""
+    prop = comp.get_first_property(kind)
+    if prop is None:
+        return ""
+    head = prop.as_ical_string().split(":", 1)[0]
+    match = re.search(r";TZID=\"?([^;:\"]+)", head)
+    if match:
+        return match.group(1)
+    return "UTC" if (prop.get_value_as_string() or "").upper().endswith("Z") else ""
+
+
+def wall_in(seconds: int, zone_name: str) -> str:
+    """An instant as the wall clock reads in a zone, "YYYY-MM-DDTHH:MM:SS";
+    in the viewer's own zone when that zone is unknown."""
+    try:
+        zone = ZoneInfo(zone_name) if zone_name and zone_name != "UTC" else (
+            timezone.utc if zone_name == "UTC" else LOCAL_TZ)
+    except Exception:
+        zone = LOCAL_TZ
+    return datetime.fromtimestamp(seconds, zone).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def event_detail(conn, uid: str, rid: str, at: str = "") -> dict:
     cals = visible_calendars(conn)
     row = conn.execute(
         "SELECT calendar, ics, url, etag FROM objects WHERE uid=? LIMIT 1", (uid,)
@@ -1000,10 +1203,36 @@ def event_detail(conn, uid: str, rid: str) -> dict:
     all_day = chosen.get_dtstart().is_date()
     detail = occurrence(chosen, cal, begin, finish, all_day, rid)
 
+    # The zones the event is written in, and its times as they read there —
+    # for the occurrence that is open (`at`, its start with an offset) and
+    # not the series' first. The form edits these walls in these zones.
+    start_zone = zone_of(parsed, chosen, ICal.PropertyKind.DTSTART_PROPERTY)
+    end_zone = zone_of(parsed, chosen, ICal.PropertyKind.DTEND_PROPERTY) or start_zone
+    shown = begin
+    if at:
+        try:
+            shown = int(datetime.fromisoformat(at).timestamp())
+        except ValueError:
+            shown = begin
+    if not all_day:
+        detail.update({
+            "startZone": start_zone, "endZone": end_zone,
+            "startWall": wall_in(shown, start_zone),
+            "endWall": wall_in(shown + (finish - begin), end_zone),
+        })
+
     attendees = []
+    attendee_list = []
     prop = chosen.get_first_property(ICal.PropertyKind.ATTENDEE_PROPERTY)
     while prop is not None:
-        attendees.append((prop.get_value_as_string() or "").replace("mailto:", ""))
+        address = strip_mailto(prop.get_value_as_string() or "")
+        attendees.append(address)
+        attendee_list.append({
+            "email": address,
+            "name": prop.get_parameter_as_string("CN") or "",
+            "status": (prop.get_parameter_as_string("PARTSTAT") or "NEEDS-ACTION").upper(),
+            "role": (prop.get_parameter_as_string("ROLE") or "").upper(),
+        })
         prop = chosen.get_next_property(ICal.PropertyKind.ATTENDEE_PROPERTY)
 
     alarms = []
@@ -1012,15 +1241,32 @@ def event_detail(conn, uid: str, rid: str) -> dict:
         alarms.append(property_text(alarm, ICal.PropertyKind.TRIGGER_PROPERTY))
         alarm = chosen.get_next_component(ICal.ComponentKind.VALARM_COMPONENT)
 
+    # An edited occurrence carries no RRULE of its own; the series' rule is
+    # on the master. It is still one of a series, and the form editing it
+    # has to show how the series repeats rather than "Never".
     rrule = chosen.get_first_property(ICal.PropertyKind.RRULE_PROPERTY)
+    if rrule is None and chosen is not master and master is not None:
+        rrule = master.get_first_property(ICal.PropertyKind.RRULE_PROPERTY)
     detail.update({
-        "description": property_text(chosen, ICal.PropertyKind.DESCRIPTION_PROPERTY),
+        # get_description() unescapes; property_text would hand the viewer
+        # "\\n" and "\\," and a save would escape them a second time.
+        "description": chosen.get_description() or "",
         "url": property_text(chosen, ICal.PropertyKind.URL_PROPERTY),
         "status": property_text(chosen, ICal.PropertyKind.STATUS_PROPERTY),
-        "organizer": property_text(chosen, ICal.PropertyKind.ORGANIZER_PROPERTY).replace("mailto:", ""),
+        "organizer": organizer_of(chosen),
         "attendees": attendees,
+        "attendeeList": attendee_list,
+        "attachments": attachments_of(chosen),
+        "place": place_of(chosen),
+        # Apple's travel time: the plain duration it blocks out before the
+        # event, whether a person set it or Maps worked it out.
+        "travel": x_property(chosen, "X-APPLE-TRAVEL-DURATION"),
         "alarms": [a for a in alarms if a],
         "rrule": (rrule.as_ical_string() or "").replace("RRULE:", "").strip() if rrule else "",
+        # The last day the rule reaches, where the person is. The form cannot
+        # work this out from the start's offset: across a DST change the UTC
+        # UNTIL falls on a different local day than that offset says.
+        "untilDate": until_date((rrule.as_ical_string() or "") if rrule else ""),
         "recurring": rrule is not None,
         "occurrences": len(overrides),
         "readonly": cal.get("readonly", False),
@@ -1084,10 +1330,1504 @@ def status(conn) -> dict:
         "lastSync": max([c["syncedAt"] for c in calendars], default=0),
         "settings": read_settings(conn),
         "cacheBytes": os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0,
+        "localZone": local_zone_name(),
+        **pending_status(conn),
     }
 
 
 # ------------------------------------------------------------------------ cli
+
+
+# ------------------------------------------------------------------- contacts
+#
+# Opt-in, read-only, and as little as possible. Only a name and an email
+# address leave each card; everything else in it — phone numbers, addresses,
+# photos, notes — is dropped as it is parsed and never stored.
+
+
+def contacts_enabled(conn) -> bool:
+    return read_settings(conn).get("contactsEnabled") is True
+
+
+def forget_contacts(conn) -> int:
+    dropped = conn.execute("DELETE FROM contacts").rowcount
+    conn.execute("DELETE FROM contact_state")
+    conn.commit()
+    return dropped
+
+
+def vcard_unescape(value: str) -> str:
+    return re.sub(r"\\([\\,;nN])",
+                  lambda m: "\n" if m.group(1) in "nN" else m.group(1), value)
+
+
+def vcard_people(text: str) -> list[tuple[str, str]]:
+    """(name, email) for every address on every card in `text`."""
+    text = re.sub(r"\r?\n[ \t]", "", text)
+    out = []
+    for card in re.split(r"(?im)^BEGIN:VCARD[ \t\r]*$", text)[1:]:
+        name, emails = "", []
+        for line in card.splitlines():
+            head, sep, value = line.partition(":")
+            if not sep:
+                continue
+            # "item1.EMAIL;type=INTERNET" -> EMAIL: Apple groups a label
+            # with its address under an item prefix.
+            prop = head.split(";")[0].split(".")[-1].upper()
+            if prop == "FN":
+                name = vcard_unescape(value).strip()
+            elif prop == "EMAIL":
+                address = strip_mailto(vcard_unescape(value))
+                if address and address.lower() not in (e.lower() for e in emails):
+                    emails.append(address)
+        out.extend((name, address) for address in emails)
+    return out
+
+
+def contact_books(session: DavSession, server: str = ICLOUD_CONTACTS) -> list[str]:
+    """current-user-principal -> addressbook-home-set -> the address books."""
+    status, body = session.request(
+        "PROPFIND", server,
+        '<?xml version="1.0"?><d:propfind xmlns:d="DAV:">'
+        "<d:prop><d:current-user-principal/></d:prop></d:propfind>",
+    )
+    if status in (401, 403):
+        raise Failure("auth", "iCloud Contacts refused this account")
+    if status not in (200, 207):
+        raise Failure("contacts", f"iCloud Contacts answered HTTP {status}")
+    principal = text_of(ET.fromstring(body), ".//d:current-user-principal/d:href")
+    if not principal:
+        raise Failure("contacts", "iCloud Contacts returned no principal")
+    principal_url = absolute(server, principal)
+
+    _, body = session.request(
+        "PROPFIND", principal_url,
+        '<?xml version="1.0"?><d:propfind xmlns:d="DAV:" '
+        'xmlns:card="urn:ietf:params:xml:ns:carddav">'
+        "<d:prop><card:addressbook-home-set/></d:prop></d:propfind>",
+    )
+    home = text_of(ET.fromstring(body), ".//card:addressbook-home-set/d:href")
+    # No home means Contacts is not syncing to iCloud on this account. That
+    # is a normal answer, not a failure: invitees are typed instead.
+    if not home:
+        return []
+    home_url = absolute(principal_url, home)
+
+    _, body = session.request(
+        "PROPFIND", home_url,
+        '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop>'
+        "<d:resourcetype/></d:prop></d:propfind>",
+        depth="1",
+    )
+    books = []
+    for resp in ET.fromstring(body).findall("d:response", NS):
+        kinds = {child.tag.split("}")[-1]
+                 for node in resp.findall(".//d:resourcetype", NS) for child in node}
+        if "addressbook" in kinds:
+            books.append(absolute(home_url, text_of(resp, "d:href")))
+    return books
+
+
+def book_people(session: DavSession, book: str) -> list[tuple[str, str]]:
+    """Every card's name and addresses: list the cards, then fetch them in
+    batches, the same two steps a calendar sync takes."""
+    _, body = session.request(
+        "PROPFIND", book,
+        '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop>'
+        "<d:getetag/></d:prop></d:propfind>",
+        depth="1",
+    )
+    hrefs = [text_of(r, "d:href") for r in ET.fromstring(body).findall("d:response", NS)]
+    hrefs = [h for h in hrefs if h and not h.endswith("/")]
+    people = []
+    for i in range(0, len(hrefs), MULTIGET_BATCH):
+        batch = hrefs[i:i + MULTIGET_BATCH]
+        # Only FN and EMAIL are asked for. A server that ignores the partial
+        # request sends whole cards, and the parser keeps the same two fields.
+        query = (
+            '<?xml version="1.0"?><card:addressbook-multiget xmlns:d="DAV:" '
+            'xmlns:card="urn:ietf:params:xml:ns:carddav"><d:prop><d:getetag/>'
+            '<card:address-data><card:prop name="FN"/><card:prop name="EMAIL"/>'
+            "</card:address-data></d:prop>"
+            + "".join(f"<d:href>{xml_escape(h)}</d:href>" for h in batch)
+            + "</card:addressbook-multiget>"
+        )
+        status, body = session.request("REPORT", book, query, depth="1")
+        if status not in (200, 207):
+            raise Failure("contacts", f"reading contacts returned HTTP {status}")
+        for resp in ET.fromstring(body).findall("d:response", NS):
+            people.extend(vcard_people(text_of(resp, ".//card:address-data")))
+    return people
+
+
+def xml_escape(value: str) -> str:
+    return (value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def sync_contacts(conn) -> dict:
+    if not contacts_enabled(conn):
+        raise Failure("contacts-off", "contacts are switched off")
+    results = []
+    for user, server in accounts_of(conn):
+        # Only an iCloud account has an iCloud address book to read.
+        if server.rstrip("/") != ICLOUD.rstrip("/"):
+            continue
+        error, people = "", []
+        session = DavSession(user, load_password(user))
+        try:
+            for book in contact_books(session):
+                people.extend(book_people(session, book))
+        except Failure as failure:
+            error = failure.message
+        except (OSError, http.client.HTTPException, ET.ParseError) as failure:
+            error = f"could not reach iCloud Contacts ({type(failure).__name__})"
+        finally:
+            session.close()
+        if not error:
+            conn.execute("DELETE FROM contacts WHERE account=?", (user,))
+            conn.executemany(
+                "INSERT INTO contacts(account,name,email) VALUES(?,?,?) "
+                "ON CONFLICT(account,email) DO UPDATE SET name=excluded.name",
+                [(user, name, email) for name, email in people])
+        conn.execute(
+            "INSERT INTO contact_state(account,synced_at,error) VALUES(?,?,?) "
+            "ON CONFLICT(account) DO UPDATE SET synced_at=excluded.synced_at, "
+            "error=excluded.error",
+            (user, int(time.time()), error))
+        results.append({"account": user, "count": len(people), "error": error})
+    conn.commit()
+    return {"ok": True, "accounts": results, **contact_list(conn)}
+
+
+# --------------------------------------------------------------------- writes
+#
+# Saving and deleting. The panel sends one JSON object on stdin describing
+# the change — the fields the form changed, the scope a series edit reaches,
+# the etag the form was opened on — and the helper edits the stored object
+# rather than rebuilding it, so everything the form does not know about
+# (Apple's X- properties, alarm sounds, attendee states) survives.
+#
+# Every write is conditional. An update sends If-Match with the etag the
+# form saw, and a create sends If-None-Match: *, so a change made on another
+# device since the form opened is never overwritten: iCloud answers 412 and
+# the form says so.
+#
+# Only the plan is built here; `run_writes` sends it. Planning touches no
+# network and no database, which is what the tests exercise.
+
+
+def local_zone_name() -> str:
+    try:
+        target = os.path.realpath("/etc/localtime")
+        if "/zoneinfo/" in target:
+            return target.split("/zoneinfo/", 1)[1]
+    except OSError:
+        pass
+    return os.environ.get("TZ", "").lstrip(":")
+
+
+def compact(value: str) -> str:
+    """'2026-09-22T09:00:00' -> '20260922T090000'; '2026-09-22' -> '20260922'."""
+    return value.replace("-", "").replace(":", "")[:15]
+
+
+def props_of(comp, kind) -> list:
+    out = []
+    prop = comp.get_first_property(kind)
+    while prop is not None:
+        out.append(prop)
+        prop = comp.get_next_property(kind)
+    return out
+
+
+def drop(comp, kind, x_name: str = "") -> None:
+    for prop in props_of(comp, kind):
+        if x_name and (prop.get_x_name() or "").upper() != x_name:
+            continue
+        comp.remove_property(prop)
+
+
+def add(comp, line: str) -> None:
+    comp.add_property(ICal.Property.new_from_string(line))
+
+
+def param_text(value: str) -> str:
+    """A parameter value: no double quotes or line breaks allowed in one, so
+    quotes become single ones and breaks become the \\n Apple writes."""
+    return str(value).replace('"', "'").replace("\r", "").replace("\n", "\\n")
+
+
+class Zones:
+    """Wall times in the viewer's zone, turned into what a property needs.
+
+    The form hands over floating wall-clock times: 09:00 means 09:00 where
+    the person is. They are written with that zone's TZID and a VTIMEZONE
+    for it, so another device in another zone shows the right instant.
+    """
+
+    def __init__(self, name: str = ""):
+        self.name = name if name is not None else ""
+        self.zone = None
+        if self.name:
+            try:
+                self.zone = ICal.Timezone.get_builtin_timezone(self.name)
+            except Exception:
+                self.zone = None
+        if self.zone is None:
+            self.name = ""
+
+    def wall(self, value: str) -> ICal.Time:
+        moment = ICal.Time.new_from_string(compact(value))
+        if self.zone is not None:
+            moment.set_timezone(self.zone)
+        return moment
+
+    def seconds(self, value: str) -> int:
+        """The instant a wall time or an offset time names."""
+        text = str(value)
+        if len(text) == 10:
+            return int(datetime.strptime(text, "%Y-%m-%d").replace(
+                tzinfo=timezone.utc).timestamp())
+        if len(text) > 19:  # carries its own offset
+            return int(datetime.fromisoformat(text).timestamp())
+        if self.zone is not None:
+            return self.wall(text).as_timet_with_zone(self.zone)
+        return int(datetime.fromisoformat(text).replace(tzinfo=LOCAL_TZ).timestamp())
+
+    def line(self, name: str, value: str) -> str:
+        if len(value) == 10:
+            return f"{name};VALUE=DATE:{compact(value)}"
+        if self.name:
+            return f"{name};TZID={self.name}:{compact(value)}"
+        instant = datetime.fromtimestamp(self.seconds(value), timezone.utc)
+        return f"{name}:{instant.strftime('%Y%m%dT%H%M%SZ')}"
+
+    def until(self, rule: str, all_day: bool) -> str:
+        """The form writes UNTIL as a date. A timed event's rule needs the
+        instant instead — the last second of that day where the person is,
+        in UTC — or the final occurrence falls outside it."""
+        match = re.search(r"UNTIL=(\d{8})(?=;|$)", rule)
+        if not match or all_day:
+            return rule
+        day = match.group(1)
+        last = f"{day[:4]}-{day[4:6]}-{day[6:]}T23:59:59"
+        instant = datetime.fromtimestamp(self.seconds(last), timezone.utc)
+        return rule.replace(f"UNTIL={day}", "UNTIL=" + instant.strftime("%Y%m%dT%H%M%SZ"))
+
+
+def moment_in(parsed, prop_line: str, seconds: int, all_day: bool) -> str:
+    """An instant written the way an existing property of the series is: a
+    RECURRENCE-ID or EXDATE has to match the master's DTSTART in form and
+    zone, or the server will not see it as the same slot."""
+    if all_day:
+        return datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y%m%d")
+    match = re.search(r";TZID=([^;:]+)", prop_line)
+    if match:
+        zone = timezone_named(parsed, match.group(1).strip('"'))
+        if zone is not None:
+            return ICal.Time.new_from_timet_with_zone(seconds, 0, zone).as_ical_string()
+    return datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def slot_line(parsed, master, name: str, seconds: int) -> str:
+    """RECURRENCE-ID or EXDATE for one slot of `master`, in its DTSTART's form."""
+    start = master.get_first_property(ICal.PropertyKind.DTSTART_PROPERTY)
+    head = start.as_ical_string().split(":", 1)[0] if start is not None else "DTSTART"
+    all_day = master.get_dtstart().is_date()
+    value = moment_in(parsed, head, seconds, all_day)
+    if all_day:
+        return f"{name};VALUE=DATE:{value}"
+    match = re.search(r";TZID=([^;:]+)", head)
+    return f"{name};TZID={match.group(1)}:{value}" if match else f"{name}:{value}"
+
+
+def stamp(comp, sequence: bool = True) -> None:
+    now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    drop(comp, ICal.PropertyKind.DTSTAMP_PROPERTY)
+    drop(comp, ICal.PropertyKind.LASTMODIFIED_PROPERTY)
+    add(comp, f"DTSTAMP:{now}")
+    add(comp, f"LAST-MODIFIED:{now}")
+    if sequence:
+        current = comp.get_first_property(ICal.PropertyKind.SEQUENCE_PROPERTY)
+        value = 0
+        if current is not None:
+            try:
+                value = int(current.get_value_as_string() or 0) + 1
+            except ValueError:
+                value = 1
+            comp.remove_property(current)
+        add(comp, f"SEQUENCE:{value}")
+
+
+def valarms(comp) -> list:
+    """The alarms the form counted, in the order it counted them — every
+    VALARM with a trigger, which is what `event --uid` lists."""
+    out = []
+    alarm = comp.get_first_component(ICal.ComponentKind.VALARM_COMPONENT)
+    while alarm is not None:
+        if property_text(alarm, ICal.PropertyKind.TRIGGER_PROPERTY):
+            out.append(alarm)
+        alarm = comp.get_next_component(ICal.ComponentKind.VALARM_COMPONENT)
+    return out
+
+
+def new_alarm(trigger: str):
+    alarm_uid = str(uuid.uuid4()).upper()
+    return ICal.Component.new_from_string(
+        "BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\n"
+        f"TRIGGER:{trigger}\r\nUID:{alarm_uid}\r\nX-WR-ALARMUID:{alarm_uid}\r\n"
+        "END:VALARM\r\n")
+
+
+def apply_alarms(comp, plan: dict) -> None:
+    """`plan` is the form's: {"set": {index: trigger}, "remove": [index],
+    "add": [trigger]}. Alarms it does not name are left exactly as they are."""
+    alarms = valarms(comp)
+    for index, trigger in (plan.get("set") or {}).items():
+        i = int(index)
+        if 0 <= i < len(alarms):
+            drop(alarms[i], ICal.PropertyKind.TRIGGER_PROPERTY)
+            add(alarms[i], f"TRIGGER:{trigger}")
+    for index in sorted({int(i) for i in plan.get("remove") or []}, reverse=True):
+        if 0 <= index < len(alarms):
+            comp.remove_component(alarms[index])
+    for trigger in plan.get("add") or []:
+        comp.add_component(new_alarm(trigger))
+
+
+def apply_invitees(comp, invitees: list, organizer: str) -> None:
+    """The new list of invitees. Anyone already on it keeps their ATTENDEE
+    as it was — their answer included — and anyone new is asked to reply.
+    With nobody invited the event stops being a meeting at all."""
+    kept = {}
+    for prop in props_of(comp, ICal.PropertyKind.ATTENDEE_PROPERTY):
+        address = strip_mailto(prop.get_value_as_string() or "").lower()
+        kept[address] = prop.as_ical_string().strip()
+        comp.remove_property(prop)
+    if not invitees:
+        drop(comp, ICal.PropertyKind.ORGANIZER_PROPERTY)
+        return
+    if comp.get_first_property(ICal.PropertyKind.ORGANIZER_PROPERTY) is None and organizer:
+        add(comp, f"ORGANIZER:mailto:{organizer}")
+    for person in invitees:
+        address = str(person.get("email", "")).strip()
+        if not address:
+            continue
+        if address.lower() in kept:
+            add(comp, kept[address.lower()].replace("\r\n ", "").replace("\n ", ""))
+            continue
+        name = param_text(person.get("name") or "")
+        cn = f';CN="{name}"' if name else ""
+        add(comp, f"ATTENDEE{cn};CUTYPE=INDIVIDUAL;PARTSTAT=NEEDS-ACTION;"
+                  f"ROLE=REQ-PARTICIPANT;RSVP=TRUE:mailto:{address}")
+
+
+def apply_fields(comp, event: dict, changes: list, zones: Zones, context: dict,
+                 times: bool) -> None:
+    """Every changed field but the recurrence, onto one VEVENT. `times` is
+    False for the overrides of an "all" edit, which keep their own."""
+    changed = set(changes)
+
+    if "title" in changed:
+        comp.set_summary(event.get("title", ""))
+    if "description" in changed:
+        drop(comp, ICal.PropertyKind.DESCRIPTION_PROPERTY)
+        if event.get("description"):
+            comp.set_description(event["description"])
+    if "location" in changed or "place" in changed:
+        drop(comp, ICal.PropertyKind.LOCATION_PROPERTY)
+        drop(comp, ICal.PropertyKind.X_PROPERTY, "X-APPLE-STRUCTURED-LOCATION")
+        if event.get("location"):
+            comp.set_location(event["location"])
+        place = event.get("place")
+        if event.get("location") and place:
+            title = param_text(place.get("title") or event["location"].split("\n")[0])
+            address = param_text(event["location"])
+            add(comp, "X-APPLE-STRUCTURED-LOCATION;VALUE=URI;"
+                      f'X-ADDRESS="{address}";X-APPLE-RADIUS=70;X-TITLE="{title}":'
+                      f"geo:{float(place['lat'])},{float(place['lon'])}")
+    if "url" in changed:
+        drop(comp, ICal.PropertyKind.URL_PROPERTY)
+        if event.get("url"):
+            add(comp, f"URL;VALUE=URI:{event['url']}")
+    if "conference" in changed:
+        drop(comp, ICal.PropertyKind.CONFERENCE_PROPERTY)
+        if event.get("conference"):
+            add(comp, f"CONFERENCE;VALUE=URI;FEATURE=VIDEO:{event['conference']}")
+    if "travel" in changed:
+        # A duration set by hand replaces one Maps worked out from a route.
+        for name in ("X-APPLE-TRAVEL-DURATION", "X-APPLE-TRAVEL-START",
+                     "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR"):
+            drop(comp, ICal.PropertyKind.X_PROPERTY, name)
+        if event.get("travel"):
+            add(comp, f"X-APPLE-TRAVEL-DURATION;VALUE=DURATION:{event['travel']}")
+    if "alarms" in changed:
+        apply_alarms(comp, context.get("alarmPlan") or {})
+    if "invitees" in changed:
+        apply_invitees(comp, context.get("invitees") or [], context.get("organizer", ""))
+    if "attachments" in changed:
+        # Removing an attachment is removing its line. That is the only way
+        # iCloud honours: it answers RFC 8607's attachment-remove with 200 and
+        # keeps the file (probed 2026-09-21), but a PUT without the ATTACH
+        # line deletes it. An invitation's file, which is only a line, goes
+        # the same way, by name.
+        gone_names = {n for n in context.get("removeNames") or []}
+        gone_ids = {n for n in context.get("removeManaged") or []}
+        for prop in props_of(comp, ICal.PropertyKind.ATTACH_PROPERTY):
+            managed = prop.get_parameter_as_string("MANAGED-ID") or ""
+            name = (prop.get_parameter_as_string("X-APPLE-FILENAME")
+                    or prop.get_parameter_as_string("FILENAME") or "")
+            if (managed and managed in gone_ids) or (not managed and name in gone_names):
+                comp.remove_property(prop)
+    if times and ({"start", "end", "allDay", "startZone", "endZone"} & changed):
+        drop(comp, ICal.PropertyKind.DTSTART_PROPERTY)
+        drop(comp, ICal.PropertyKind.DTEND_PROPERTY)
+        drop(comp, ICal.PropertyKind.DURATION_PROPERTY)
+        add(comp, zone_for(event.get("startZone"), zones).line("DTSTART", event["start"]))
+        add(comp, zone_for(event.get("endZone") or event.get("startZone"), zones)
+            .line("DTEND", event["end"]))
+
+
+def zone_for(name, fallback: Zones) -> Zones:
+    """The Zones for an event's own zone, or the viewer's when it has none."""
+    if not name or name == fallback.name:
+        return fallback
+    if name == "UTC":
+        return Zones("UTC") if Zones("UTC").zone is not None else fallback
+    chosen = Zones(name)
+    return chosen if chosen.zone is not None else fallback
+
+
+def add_zones(parsed, zones: Zones, event: dict) -> None:
+    """A VTIMEZONE for every zone the event's times now point at."""
+    for name in {zones.name, event.get("startZone") or "", event.get("endZone") or ""}:
+        if name:
+            add_zone(parsed, zone_for(name, zones))
+
+
+def add_zone(parsed, zones: Zones) -> None:
+    """The VTIMEZONE a TZID of ours points at, once, and only if something
+    in the object refers to it.
+
+    libical's built-in zones carry TZID "/freeassociation.sourceforge.net/
+    America/Chicago"; a DTSTART saying TZID=America/Chicago would point at
+    nothing, so the definition is renamed to the name the times use.
+    """
+    # Only when something in the object now points at it.
+    if not zones.name or f"TZID={zones.name}" not in parsed.as_ical_string():
+        return
+    comp = parsed.get_first_component(ICal.ComponentKind.VTIMEZONE_COMPONENT)
+    while comp is not None:
+        if property_text(comp, ICal.PropertyKind.TZID_PROPERTY) == zones.name:
+            return
+        comp = parsed.get_next_component(ICal.ComponentKind.VTIMEZONE_COMPONENT)
+    definition = zones.zone.get_component().clone()
+    drop(definition, ICal.PropertyKind.TZID_PROPERTY)
+    add(definition, f"TZID:{zones.name}")
+    parsed.add_component(definition)
+
+
+def blank_calendar() -> object:
+    return ICal.Component.new_from_string(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//omarcal//omarcal//EN\r\n"
+        "CALSCALE:GREGORIAN\r\nEND:VCALENDAR\r\n")
+
+
+def new_event_object(event: dict, zones: Zones, context: dict, uid: str):
+    parsed = blank_calendar()
+    comp = ICal.Component.new_from_string(
+        f"BEGIN:VEVENT\r\nUID:{uid}\r\nEND:VEVENT\r\n")
+    everything = ["title", "description", "location", "place", "url", "conference",
+                  "travel", "alarms", "invitees", "start", "end", "startZone", "endZone"]
+    apply_fields(comp, event, everything, zones, context, True)
+    if event.get("rrule"):
+        add(comp, "RRULE:" + zone_for(event.get("startZone"), zones)
+            .until(event["rrule"], event.get("allDay", False)))
+    stamp(comp, sequence=False)
+    add(comp, "SEQUENCE:0")
+    parsed.add_component(comp)
+    add_zones(parsed, zones, event)
+    return parsed
+
+
+def object_url(calendar_url: str, uid: str) -> str:
+    return calendar_url.rstrip("/") + "/" + re.sub(r"[^A-Za-z0-9._-]", "-", uid) + ".ics"
+
+
+def occurrences_before(master, seconds: int, parsed) -> int:
+    """How many occurrences of `master` start before `seconds` — what a COUNT
+    has used up by the time a series is split there."""
+    count = 0
+    try:
+        recur = master.get_first_property(ICal.PropertyKind.RRULE_PROPERTY).get_rrule()
+        iterator = ICal.RecurIterator.new(recur, master.get_dtstart())
+        for _ in range(MAX_EXPAND):
+            moment = iterator.next()
+            if moment is None or moment.is_null_time():
+                break
+            when = absolute_time(parsed, moment) if not moment.is_date() else moment.as_timet()
+            if when is None or when >= seconds:
+                break
+            count += 1
+    except Exception:
+        return 0
+    return count
+
+
+def end_series_before(parsed, master, seconds: int) -> None:
+    """The series stops just before `seconds`: an UNTIL one second earlier
+    (the day before, for an all-day series), in place of any COUNT."""
+    rule = master.get_first_property(ICal.PropertyKind.RRULE_PROPERTY)
+    if rule is None:
+        return
+    text = (rule.as_ical_string() or "").strip().replace("RRULE:", "")
+    parts = [p for p in text.split(";") if not p.upper().startswith(("UNTIL=", "COUNT="))]
+    if master.get_dtstart().is_date():
+        last = datetime.fromtimestamp(seconds - 86400, timezone.utc).strftime("%Y%m%d")
+    else:
+        last = datetime.fromtimestamp(seconds - 1, timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    master.remove_property(rule)
+    add(master, "RRULE:" + ";".join(parts + [f"UNTIL={last}"]))
+
+
+def rid_seconds(parsed, comp) -> int | None:
+    rid = comp.get_recurrenceid()
+    return absolute_time(parsed, rid) if rid is not None and not rid.is_null_time() else None
+
+
+def shift_prop(parsed, comp, kind, delta: int, master) -> None:
+    """Move every value of a date property by `delta` seconds, keeping the
+    form it was written in."""
+    for prop in props_of(comp, kind):
+        head = prop.as_ical_string().split(":", 1)[0].replace("\r\n ", "")
+        value = prop.get_value_as_string() or ""
+        all_day = "VALUE=DATE" in head.upper() and "DATE-TIME" not in head.upper()
+        moments = []
+        for piece in value.split(","):
+            try:
+                moment = ICal.Time.new_from_string(piece.strip())
+            except Exception:
+                continue
+            match = re.search(r";TZID=([^;:]+)", head)
+            if match:
+                zone = timezone_named(parsed, match.group(1))
+                when = moment.as_timet_with_zone(zone) if zone else moment.as_timet()
+            else:
+                when = moment.as_timet()
+            moments.append(moment_in(parsed, head, when + delta, all_day))
+        comp.remove_property(prop)
+        if moments:
+            add(comp, head + ":" + ",".join(moments))
+
+
+def occurrence_of(parsed, overrides: dict, request: dict, zones: Zones) -> int | None:
+    """The slot an edit is about, as an instant. An exception is found by its
+    rid — its own start may be anywhere by now, and the slot is what names
+    it — and any other occurrence by where it starts."""
+    rid = request.get("rid") or ""
+    if rid:
+        for at, comp in overrides.items():
+            recurrence = comp.get_recurrenceid()
+            if rid in (str(at), recurrence.as_ical_string() if recurrence else ""):
+                return at
+    if request.get("occurrenceStart"):
+        return zones.seconds(request["occurrenceStart"])
+    return None
+
+
+def clean(parsed):
+    """What libical adds of its own before an object goes back. Reading an
+    empty property (Apple writes `URL:` with nothing after it) makes libical
+    drop it and leave an X-LIC-ERROR line saying so — which would be sent to
+    iCloud and kept there as if it were part of the event."""
+    def scrub(comp):
+        for prop in props_of(comp, ICal.PropertyKind.XLICERROR_PROPERTY):
+            comp.remove_property(prop)
+        child = comp.get_first_component(ICal.ComponentKind.ANY_COMPONENT)
+        while child is not None:
+            scrub(child)
+            child = comp.get_next_component(ICal.ComponentKind.ANY_COMPONENT)
+    scrub(parsed)
+    return parsed
+
+
+def instance_start(parsed, overrides: dict, occurrence: int) -> int:
+    """Where the occurrence being edited starts now: an exception's own start,
+    which may be hours off its slot, or else the slot itself. A move is
+    measured from here — from where the person saw it — not from the slot."""
+    comp = overrides.get(occurrence)
+    if comp is not None:
+        begin, _ = span_of(parsed, comp)
+        return begin
+    return occurrence
+
+
+def wall(seconds: int, zones: Zones, all_day: bool) -> str:
+    """An instant as the form's wall time (or date) in the viewer's zone."""
+    if all_day:
+        return datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%d")
+    zone = ZoneInfo(zones.name) if zones.name else LOCAL_TZ
+    return datetime.fromtimestamp(seconds, zone).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+# What an "all" or "following" edit carries to a series' exceptions: the
+# fields the person changed, but not its times or rule — each exception has
+# its own — and not its alarms, which the form counted on the event it showed
+# and which mean nothing by position on another one.
+OVERRIDE_SKIPS = ("start", "end", "allDay", "startZone", "endZone", "rrule", "alarms")
+
+# A change to any of these moves the event: a zone as much as a clock time,
+# since the same 09:00 in another zone is another instant.
+TIME_FIELDS = {"start", "end", "allDay", "startZone", "endZone"}
+
+
+def plan_save(ics: str, request: dict, zones: Zones) -> list[dict]:
+    """The PUTs and DELETEs a save comes to. `ics` is the object as stored,
+    or "" for a new event.
+
+    request: {scope, href, etag, targetCalendarUrl, uid, occurrenceStart,
+              changes, event, alarmPlan, invitees, organizer, removeNames}
+    """
+    event = request["event"]
+    changes = list(request.get("changes") or [])
+    # Each end in its own zone: the form's walls are read there.
+    sz = zone_for(event.get("startZone"), zones)
+    ez = zone_for(event.get("endZone") or event.get("startZone"), zones)
+    context = request
+    target = request.get("targetCalendarUrl") or ""
+
+    # A new event: one PUT, and nothing on the server may be in its place.
+    if not ics:
+        uid = request.get("newUid") or str(uuid.uuid4()).upper()
+        parsed = new_event_object(event, zones, context, uid)
+        return [{"method": "PUT", "url": object_url(target, uid),
+                 "body": clean(parsed).as_ical_string(), "ifNoneMatch": True, "uid": uid,
+                 "primary": True}]
+
+    parsed = parse_ics(ics)
+    if parsed is None:
+        raise Failure("parse", "the stored event could not be read to change it")
+    master, overrides = split_master_overrides(parsed, vevents(parsed))
+    scope = request.get("scope") or "all"
+    series = master is not None and (
+        master.get_first_property(ICal.PropertyKind.RRULE_PROPERTY) is not None
+        or bool(overrides))
+    href, etag = request["href"], request.get("etag") or ""
+    moving = bool(target) and target != request.get("calendarUrl")
+
+    occurrence = occurrence_of(parsed, overrides, request, zones) if series else None
+    # The first occurrence onward is all of them.
+    if scope == "following" and occurrence is not None and master is not None:
+        first = absolute_time(parsed, master.get_dtstart())
+        if first is not None and occurrence <= first:
+            scope = "all"
+
+    rule_changed = "rrule" in changes
+
+    if not series or scope == "all":
+        comps = [master] if master is not None else vevents(parsed)
+        head = comps[0]
+        if series and (TIME_FIELDS & set(changes)) and occurrence is not None:
+            # The occurrence was moved; the series moves by as much, and so do
+            # its exceptions and its excluded dates, so each still names the
+            # slot it names now.
+            delta = sz.seconds(event["start"]) - instance_start(parsed, overrides, occurrence)
+            length = ez.seconds(event["end"]) - sz.seconds(event["start"])
+            begin = absolute_time(parsed, head.get_dtstart()) or occurrence
+            all_day = len(event["start"]) == 10
+            moved = dict(event, start=wall(begin + delta, sz, all_day),
+                         end=wall(begin + delta + length, ez, all_day))
+            apply_fields(head, moved, changes, zones, context, True)
+            if delta:
+                shift_prop(parsed, head, ICal.PropertyKind.EXDATE_PROPERTY, delta, head)
+                for comp in overrides.values():
+                    shift_prop(parsed, comp, ICal.PropertyKind.RECURRENCEID_PROPERTY, delta, head)
+                    shift_prop(parsed, comp, ICal.PropertyKind.DTSTART_PROPERTY, delta, head)
+                    shift_prop(parsed, comp, ICal.PropertyKind.DTEND_PROPERTY, delta, head)
+        else:
+            apply_fields(head, event, changes, zones, context, True)
+        if series:
+            for comp in overrides.values():
+                apply_fields(comp, event, [c for c in changes if c not in OVERRIDE_SKIPS],
+                             zones, context, False)
+                stamp(comp)
+        if rule_changed and master is not None:
+            drop(master, ICal.PropertyKind.RRULE_PROPERTY)
+            if event.get("rrule"):
+                add(master, "RRULE:" + sz.until(event["rrule"], event.get("allDay", False)))
+        stamp(head)
+        add_zones(parsed, zones, event)
+        if moving:
+            # To another calendar: made there under a new UID — a UID is
+            # unique within an account's calendars — and only then deleted
+            # here, so a failure midway leaves a copy rather than nothing.
+            uid = request.get("newUid") or str(uuid.uuid4()).upper()
+            for comp in vevents(parsed):
+                comp.set_uid(uid)
+            return [{"method": "PUT", "url": object_url(target, uid),
+                     "body": clean(parsed).as_ical_string(), "ifNoneMatch": True, "uid": uid,
+                     "primary": True},
+                    {"method": "DELETE", "url": href, "ifMatch": etag}]
+        return [{"method": "PUT", "url": href, "body": clean(parsed).as_ical_string(),
+                 "ifMatch": etag, "primary": True}]
+
+    if occurrence is None or master is None:
+        raise Failure("usage", "a change to one occurrence needs its start")
+
+    if scope == "this":
+        existing = overrides.get(occurrence)
+        if existing is None:
+            # A new exception: the master's own properties, for this slot.
+            existing = master.clone()
+            for kind in (ICal.PropertyKind.RRULE_PROPERTY, ICal.PropertyKind.RDATE_PROPERTY,
+                         ICal.PropertyKind.EXDATE_PROPERTY):
+                drop(existing, kind)
+            add(existing, slot_line(parsed, master, "RECURRENCE-ID", occurrence))
+            parsed.add_component(existing)
+            # It needs its own times even when they did not change.
+            apply_fields(existing, event, list(set(changes) | {"start", "end"}),
+                         zones, context, True)
+        else:
+            apply_fields(existing, event, changes, zones, context, True)
+        stamp(existing)
+        add_zones(parsed, zones, event)
+        return [{"method": "PUT", "url": href, "body": clean(parsed).as_ical_string(),
+                 "ifMatch": etag, "primary": True}]
+
+    # "following": the series ends before this occurrence, and a new one —
+    # a new UID, in the target calendar if it changed — starts here with the
+    # changes. Exceptions and excluded dates from here on go with it when the
+    # times did not move, and are dropped when they did, since the slots they
+    # name no longer exist.
+    # The new series starts at this occurrence's slot, moved by as much as
+    # the person moved the occurrence from where they saw it — an exception
+    # may sit hours off its slot, and the rest of the series is not there.
+    times_changed = bool(TIME_FIELDS & set(changes))
+    if times_changed:
+        all_day = bool(event.get("allDay"))
+        new_start = occurrence + sz.seconds(event["start"]) - instance_start(parsed, overrides, occurrence)
+        length = ez.seconds(event["end"]) - sz.seconds(event["start"])
+    else:
+        all_day = master.get_dtstart().is_date()
+        first, last = span_of(parsed, master)
+        new_start, length = occurrence, last - first
+    shifted = new_start != occurrence
+    starting = dict(event, start=wall(new_start, sz, all_day),
+                    end=wall(new_start + length, ez, all_day))
+    used = occurrences_before(master, occurrence, parsed)
+    later = {at: comp for at, comp in overrides.items() if at >= occurrence}
+
+    fresh = blank_calendar()
+    head = master.clone()
+    new_uid = request.get("newUid") or str(uuid.uuid4()).upper()
+    head.set_uid(new_uid)
+    apply_fields(head, starting, list(set(changes) | {"start", "end"}), zones, context, True)
+    rule = event.get("rrule") if rule_changed else (
+        (master.get_first_property(ICal.PropertyKind.RRULE_PROPERTY).as_ical_string() or "")
+        .strip().replace("RRULE:", ""))
+    drop(head, ICal.PropertyKind.RRULE_PROPERTY)
+    drop(head, ICal.PropertyKind.EXDATE_PROPERTY)
+    if rule:
+        rule = sz.until(rule, event.get("allDay", False))
+        count = re.search(r"COUNT=(\d+)", rule)
+        if count and not rule_changed:
+            left = max(1, int(count.group(1)) - used)
+            rule = rule.replace(count.group(0), f"COUNT={left}")
+        add(head, "RRULE:" + rule)
+    if not shifted:
+        for prop in props_of(master, ICal.PropertyKind.EXDATE_PROPERTY):
+            value = prop.get_value_as_string() or ""
+            try:
+                at = absolute_time(parsed, ICal.Time.new_from_string(value.split(",")[0]))
+            except Exception:
+                at = None
+            if at is not None and at >= occurrence:
+                add(head, prop.as_ical_string().strip().replace("\r\n ", ""))
+    stamp(head, sequence=False)
+    fresh.add_component(head)
+    for at, comp in later.items():
+        parsed.remove_component(comp)
+        if not shifted:
+            # Carried over with the change, so the occurrence that was edited
+            # — if it is one of these — shows it.
+            moved = comp.clone()
+            moved.set_uid(new_uid)
+            apply_fields(moved, event, [c for c in changes if c not in OVERRIDE_SKIPS],
+                         zones, context, False)
+            fresh.add_component(moved)
+    zone_comp = parsed.get_first_component(ICal.ComponentKind.VTIMEZONE_COMPONENT)
+    while zone_comp is not None:
+        fresh.add_component(zone_comp.clone())
+        zone_comp = parsed.get_next_component(ICal.ComponentKind.VTIMEZONE_COMPONENT)
+    add_zones(fresh, zones, event)
+
+    end_series_before(parsed, master, occurrence)
+    stamp(master)
+    calendar = target or request.get("calendarUrl") or href.rsplit("/", 1)[0] + "/"
+    return [{"method": "PUT", "url": href, "body": clean(parsed).as_ical_string(), "ifMatch": etag},
+            {"method": "PUT", "url": object_url(calendar, new_uid),
+             "body": clean(fresh).as_ical_string(), "ifNoneMatch": True, "uid": new_uid,
+             "primary": True}]
+
+
+def plan_delete(ics: str, request: dict, zones: Zones) -> list[dict]:
+    """What deleting comes to: the whole object, or for one of a series, an
+    excluded date (this) or an earlier end (following)."""
+    href, etag = request["href"], request.get("etag") or ""
+    scope = request.get("scope") or "all"
+    parsed = parse_ics(ics) if ics else None
+    master, overrides = (split_master_overrides(parsed, vevents(parsed))
+                         if parsed is not None else (None, {}))
+    series = master is not None and (
+        master.get_first_property(ICal.PropertyKind.RRULE_PROPERTY) is not None
+        or bool(overrides))
+    occurrence = occurrence_of(parsed, overrides, request, zones) if series else None
+
+    if series and occurrence is not None and scope == "following":
+        first = absolute_time(parsed, master.get_dtstart())
+        if first is not None and occurrence <= first:
+            scope = "all"
+
+    if not series or scope == "all" or occurrence is None:
+        return [{"method": "DELETE", "url": href, "ifMatch": etag}]
+
+    if scope == "this":
+        existing = overrides.get(occurrence)
+        if existing is not None:
+            parsed.remove_component(existing)
+        add(master, slot_line(parsed, master, "EXDATE", occurrence))
+        stamp(master)
+        return [{"method": "PUT", "url": href, "body": clean(parsed).as_ical_string(), "ifMatch": etag}]
+
+    for at, comp in overrides.items():
+        if at >= occurrence:
+            parsed.remove_component(comp)
+    end_series_before(parsed, master, occurrence)
+    stamp(master)
+    return [{"method": "PUT", "url": href, "body": clean(parsed).as_ical_string(), "ifMatch": etag}]
+
+
+CONFLICT_MESSAGE = ("This event changed on iCloud since it was opened — on another "
+                    "device, perhaps. Nothing was saved. Close it and open it again "
+                    "to see the latest.")
+
+
+def send(session: DavSession, method: str, url: str, body: bytes | None,
+         headers: dict) -> tuple[int, dict, bytes]:
+    host, path = split_url(url)
+    sent = {"Authorization": session.headers["Authorization"],
+            "User-Agent": session.headers["User-Agent"]}
+    sent.update(headers)
+    for attempt in (1, 2):
+        conn = session._connection(host)
+        try:
+            conn.request(method, path, body=body, headers=sent)
+            resp = conn.getresponse()
+            return resp.status, {k.lower(): v for k, v in resp.getheaders()}, resp.read(
+                MAX_RESPONSE_BYTES)
+        except (http.client.HTTPException, OSError):
+            try:
+                conn.close()
+            except OSError:
+                pass
+            session._local.pool.pop(host, None)
+            if attempt == 2:
+                raise
+    raise Failure("transport", "unreachable")
+
+
+def run_writes(session, ops: list[dict]) -> list[dict]:
+    """Send the plan in order, stopping at the first refusal. A 412 is a
+    conflict, said as one; anything else is reported with its status.
+
+    `session` is a DavSession, or a function from a URL to the session of
+    the account that URL belongs to — a move between accounts writes to two
+    servers with two sets of credentials."""
+    session_for = session if callable(session) else (lambda _url: session)
+    done = []
+    for op in ops:
+        session = session_for(op["url"])
+        headers = {}
+        body = None
+        if op["method"] == "PUT":
+            headers["Content-Type"] = "text/calendar; charset=utf-8"
+            body = op["body"].encode("utf-8")
+            if op.get("ifNoneMatch"):
+                headers["If-None-Match"] = "*"
+        if op.get("ifMatch"):
+            headers["If-Match"] = op["ifMatch"]
+        try:
+            status, got, data = send(session, op["method"], op["url"], body, headers)
+        except (OSError, http.client.HTTPException) as error:
+            # Nothing sent yet is a save that can wait; something sent is
+            # a plan cut in half, which is said as that.
+            if not done:
+                raise Failure("offline", f"iCloud could not be reached ({type(error).__name__})")
+            raise Failure("write", "the connection dropped partway through saving; "
+                                   "sync to see what reached iCloud")
+        if status == 412:
+            raise Failure("conflict", CONFLICT_MESSAGE)
+        if op["method"] == "DELETE" and status == 404:
+            status = 204  # already gone is gone
+        if status not in (200, 201, 204):
+            detail = re.sub(r"<[^>]+>", " ", data.decode("utf-8", "replace"))
+            detail = re.sub(r"\s+", " ", detail).strip()[:160]
+            raise Failure("write", f"iCloud refused the {op['method']} "
+                                   f"(HTTP {status}){': ' + detail if detail else ''}")
+        done.append({"method": op["method"], "url": op["url"], "etag": got.get("etag", ""),
+                     "uid": op.get("uid", ""), "primary": bool(op.get("primary"))})
+    return done
+
+
+def run_attachments(session: DavSession, url: str, add_files: list, remove_ids: list) -> list[str]:
+    """RFC 8607 managed attachments, after the event itself is written.
+    Returns what could not be done, in words; the event is saved either way."""
+    problems = []
+    for managed in remove_ids:
+        status, _, _ = send(session, "POST",
+                            f"{url}?action=attachment-remove&managed-id={quote(managed)}",
+                            None, {})
+        if status not in (200, 201, 204):
+            problems.append(f"an attachment could not be removed (HTTP {status})")
+    for item in add_files:
+        path = item.get("path", "")
+        name = os.path.basename(path)
+        try:
+            with open(path, "rb") as src:
+                data = src.read(20 * 1000 * 1000 + 1)
+        except OSError as error:
+            problems.append(f"{name} could not be read ({error.strerror})")
+            continue
+        if len(data) > 20 * 1000 * 1000:
+            problems.append(f"{name} is over iCloud's 20 MB")
+            continue
+        status, _, _ = send(session, "POST", f"{url}?action=attachment-add", data, {
+            "Content-Type": item.get("type") or "application/octet-stream",
+            "Content-Disposition": f'attachment;filename="{param_text(name)}"'})
+        if status not in (200, 201, 204):
+            problems.append(f"{name} was not attached (HTTP {status})")
+    return problems
+
+
+def component_key(comp) -> str:
+    rid = comp.get_recurrenceid()
+    return f"{comp.get_uid()}|{rid.as_ical_string() if rid is not None and not rid.is_null_time() else ''}"
+
+
+def restore_after_attachments(session: DavSession, url: str, sent: str) -> str:
+    """Put back what iCloud drops when an attachment is added or removed.
+
+    iCloud rewrites the event on attachment-add and attachment-remove and
+    leaves out its alarms and its travel time (probed 2026-09-21: VALARM and
+    X-APPLE-TRAVEL-DURATION both gone after one attachment-add). So the event
+    goes back as omarcal wrote it, with the ATTACH lines iCloud now has in
+    place of the ones it had — conditional on iCloud's new etag, so nothing
+    written in between is overwritten. Returns a problem in words, or "".
+    """
+    status, got, data = send(session, "GET", url, None, {})
+    if status != 200:
+        return f"the event could not be read back after its attachments changed (HTTP {status})"
+    server = parse_ics(data.decode("utf-8", "replace"))
+    ours = parse_ics(sent)
+    if server is None or ours is None:
+        return "the event could not be read back after its attachments changed"
+    attached = {}
+    for comp in vevents(server):
+        attached[component_key(comp)] = [p.as_ical_string().strip()
+                                         for p in props_of(comp, ICal.PropertyKind.ATTACH_PROPERTY)]
+    for comp in vevents(ours):
+        drop(comp, ICal.PropertyKind.ATTACH_PROPERTY)
+        for line in attached.get(component_key(comp), []):
+            add(comp, line.replace("\r\n ", "").replace("\n ", ""))
+    body = clean(ours).as_ical_string()
+    if body == data.decode("utf-8", "replace"):
+        return ""
+    status, _, _ = send(session, "PUT", url, body.encode("utf-8"), {
+        "Content-Type": "text/calendar; charset=utf-8", "If-Match": got.get("etag", "")})
+    if status == 412:
+        return "the event changed on iCloud while its attachments were being saved"
+    if status not in (200, 201, 204):
+        return f"alerts and travel time could not be put back after the attachments (HTTP {status})"
+    return ""
+
+
+def refresh_objects(conn, session: DavSession, urls: list[str], gone: list[str]) -> None:
+    """Bring the cache level with what was just written, without a sync."""
+    for url in gone:
+        conn.execute("DELETE FROM objects WHERE url=?", (url,))
+    for url in urls:
+        status, got, data = send(session, "GET", url, None, {})
+        if status != 200:
+            continue
+        text = data.decode("utf-8", "replace")
+        first, last, open_ended, summary, uid = index_of(text)
+        calendar = url.rsplit("/", 1)[0] + "/"
+        conn.execute(
+            "INSERT INTO objects(url,calendar,etag,ics,first_start,last_end,open_ended,"
+            "summary,uid,pending) VALUES(?,?,?,?,?,?,?,?,?,0) ON CONFLICT(url) DO UPDATE SET "
+            "calendar=excluded.calendar, etag=excluded.etag, ics=excluded.ics, "
+            "first_start=excluded.first_start, last_end=excluded.last_end, "
+            "open_ended=excluded.open_ended, summary=excluded.summary, uid=excluded.uid, "
+            "pending=0",
+            (url, calendar, got.get("etag", ""), text, first, last, open_ended, summary, uid))
+    conn.commit()
+
+
+def account_of_url(conn, url: str) -> str:
+    """The account whose calendar `url` is, or is inside."""
+    row = conn.execute(
+        "SELECT account FROM calendars WHERE ? LIKE url || '%' ORDER BY length(url) DESC LIMIT 1",
+        (url,)).fetchone()
+    return row[0] if row and row[0] else ""
+
+
+def account_for(conn, calendar_url: str) -> str:
+    row = conn.execute("SELECT account FROM calendars WHERE url=?", (calendar_url,)).fetchone()
+    if not row or not row[0]:
+        raise Failure("not-found", "that calendar is not one omarcal knows")
+    return row[0]
+
+
+# --------------------------------------------------------------------- queue
+#
+# A save made while iCloud cannot be reached is kept and shown at once: its
+# planned objects go into the cache marked pending, over what they replace,
+# and what they replaced is kept aside. The next sync replays each on the
+# version it was made against — never on the pending version, so an edit
+# like "remove the second alarm" cannot happen twice — and the answer
+# replaces the pending objects. One that iCloud refuses is undone from the
+# display with everything queued after it, and said.
+
+
+def queued_count(conn) -> int:
+    return conn.execute("SELECT COUNT(*) FROM pending WHERE state='queued'").fetchone()[0]
+
+
+def put_row(conn, url: str, ics: str, etag: str, pending: int) -> None:
+    first, last, open_ended, summary, uid = index_of(ics)
+    calendar = url.rsplit("/", 1)[0] + "/"
+    conn.execute(
+        "INSERT INTO objects(url,calendar,etag,ics,first_start,last_end,open_ended,summary,uid,"
+        "pending) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(url) DO UPDATE SET "
+        "calendar=excluded.calendar, etag=excluded.etag, ics=excluded.ics, "
+        "first_start=excluded.first_start, last_end=excluded.last_end, "
+        "open_ended=excluded.open_ended, summary=excluded.summary, uid=excluded.uid, "
+        "pending=excluded.pending",
+        (url, calendar, etag, ics, first, last, open_ended, summary, uid, pending))
+
+
+def enqueue(conn, request: dict, deleting: bool) -> dict:
+    zones = Zones(local_zone_name())
+    ics = base_of(conn, request)
+    ops = plan_delete(ics, request, zones) if deleting else plan_save(ics, request, zones)
+    # The UID a new object was planned with is the one it is sent with, so
+    # the pending object and the sent one are the same object.
+    new_uid = next((op["uid"] for op in ops if op.get("uid")), "")
+    if new_uid:
+        request["newUid"] = new_uid
+    # Replayed on the version it was made against, whatever the cache holds
+    # by then — a later queued edit to the same event changes the cache.
+    if request.get("href"):
+        request["baseIcs"] = ics
+    title = (request.get("event") or {}).get("title") or ""
+    if not title and request.get("href"):
+        row = conn.execute("SELECT summary FROM objects WHERE url=?", (request["href"],)).fetchone()
+        title = row[0] if row else ""
+    cur = conn.execute(
+        "INSERT INTO pending(action, request, title, created) VALUES(?,?,?,?)",
+        ("delete" if deleting else "save", json.dumps(request), title, int(time.time())))
+    pending_id = cur.lastrowid
+    for op in ops:
+        row = conn.execute("SELECT calendar, etag, ics FROM objects WHERE url=?",
+                           (op["url"],)).fetchone()
+        conn.execute(
+            "INSERT INTO pending_backup(pending_id, url, existed, calendar, etag, ics) "
+            "VALUES(?,?,?,?,?,?)",
+            (pending_id, op["url"], 1 if row else 0, row[0] if row else "",
+             row[1] if row else "", row[2] if row else ""))
+        if op["method"] == "PUT":
+            put_row(conn, op["url"], clean(parse_ics(op["body"])).as_ical_string(), "", 1)
+        else:
+            conn.execute("DELETE FROM objects WHERE url=?", (op["url"],))
+    conn.commit()
+    return {"ok": True, "queued": True, "pending": queued_count(conn)}
+
+
+def undo_pending(conn, pending_id: int) -> None:
+    """Put back what one queued change replaced in the cache."""
+    for url, existed, calendar, etag, ics in conn.execute(
+            "SELECT url, existed, calendar, etag, ics FROM pending_backup "
+            "WHERE pending_id=? ORDER BY rowid DESC", (pending_id,)).fetchall():
+        if existed:
+            put_row(conn, url, ics, etag, 0)
+        else:
+            conn.execute("DELETE FROM objects WHERE url=?", (url,))
+
+
+def flush_pending(conn) -> dict:
+    """Send what is queued, in order. Stops quietly while still offline."""
+    sent = 0
+    rows = conn.execute("SELECT id, action, request FROM pending WHERE state='queued' "
+                        "ORDER BY id").fetchall()
+    for index, (pending_id, action, text) in enumerate(rows):
+        request = json.loads(text)
+        try:
+            send_event(conn, request, action == "delete")
+        except Failure as failure:
+            if failure.code == "offline":
+                return {"sent": sent, "offline": True}
+            # Refused: this change and every one queued after it come off the
+            # display — later ones were made on top of it — newest first.
+            later = [r[0] for r in rows[index:]]
+            for undo_id in reversed(later):
+                undo_pending(conn, undo_id)
+            conn.execute("UPDATE pending SET state='conflict', error=? WHERE id=?",
+                         (failure.message, pending_id))
+            for held in later[1:]:
+                conn.execute("UPDATE pending SET state='conflict', error=? WHERE id=?",
+                             ("not sent: an earlier change could not be", held))
+            conn.commit()
+            return {"sent": sent, "conflict": True}
+        conn.execute("DELETE FROM pending_backup WHERE pending_id=?", (pending_id,))
+        conn.execute("DELETE FROM pending WHERE id=?", (pending_id,))
+        conn.commit()
+        sent += 1
+    return {"sent": sent}
+
+
+def pending_status(conn) -> dict:
+    problems = [{"id": r[0], "title": r[1], "error": r[2], "action": r[3]} for r in conn.execute(
+        "SELECT id, title, error, action FROM pending WHERE state='conflict' ORDER BY id")]
+    return {"pending": queued_count(conn), "pendingProblems": problems}
+
+
+def base_of(conn, request: dict) -> str:
+    """The stored object a change is made to: the version it was queued
+    against when it is being replayed, or the cache's."""
+    href = request.get("href") or ""
+    if not href:
+        return ""
+    row = conn.execute("SELECT ics, etag, calendar FROM objects WHERE url=?", (href,)).fetchone()
+    if "baseIcs" in request:
+        # Queued on top of a change of ours that was not sent then: that one
+        # has been sent by now, and its etag is what this one is sent against.
+        if not request.get("etag") and row:
+            request["etag"] = row[1]
+        return request["baseIcs"]
+    if not row:
+        raise Failure("not-found", "that event is no longer in the cache — sync and try again")
+    if not request.get("etag"):
+        request["etag"] = row[1]
+    request.setdefault("calendarUrl", row[2])
+    return row[0]
+
+
+def write_event(conn, request: dict, deleting: bool) -> dict:
+    """The `save` and `delete` commands. Sent now when iCloud can be reached
+    and nothing is waiting; otherwise queued, shown at once, and sent by the
+    next sync. Anything already queued goes first, so changes reach iCloud
+    in the order they were made."""
+    if request.get("dryRun"):
+        return send_event(conn, request, deleting)
+    if queued_count(conn):
+        flush_pending(conn)
+        if queued_count(conn):
+            return enqueue(conn, request, deleting)
+    try:
+        return send_event(conn, request, deleting)
+    except Failure as failure:
+        if failure.code != "offline":
+            raise
+        return enqueue(conn, request, deleting)
+
+
+def send_event(conn, request: dict, deleting: bool) -> dict:
+    zones = Zones(local_zone_name())
+    ics = base_of(conn, request)
+    calendar = request.get("calendarUrl") or request.get("targetCalendarUrl") or ""
+    user = account_for(conn, calendar)
+    ops = plan_delete(ics, request, zones) if deleting else plan_save(ics, request, zones)
+
+    # What would be sent, and nothing sent: for checking a plan against a
+    # real stored event without touching the server.
+    if request.get("dryRun"):
+        return {"ok": True, "dryRun": True, "ops": [
+            {k: v for k, v in op.items()} for op in ops]}
+
+    sessions: dict[str, DavSession] = {}
+
+    def session_for(url: str) -> DavSession:
+        owner = account_of_url(conn, url) or user
+        if owner not in sessions:
+            sessions[owner] = DavSession(owner, load_password(owner))
+        return sessions[owner]
+
+    try:
+        done = run_writes(session_for, ops)
+        written = [d["url"] for d in done if d["method"] == "PUT"]
+        removed = [d["url"] for d in done if d["method"] == "DELETE"]
+        problems = []
+        primary = next((d["url"] for d in done if d["primary"]), "")
+        # Removals went with the PUT; only additions need the attachment
+        # endpoint, and then the repair iCloud's rewrite calls for.
+        if not deleting and primary and request.get("addFiles"):
+            problems = run_attachments(session_for(primary), primary,
+                                       request.get("addFiles") or [], [])
+            sent = next(op["body"] for op in ops if op.get("primary"))
+            restored = restore_after_attachments(session_for(primary), primary, sent)
+            if restored:
+                problems.append(restored)
+        for url in written:
+            refresh_objects(conn, session_for(url), [url], [])
+        refresh_objects(conn, None, [], removed)
+    finally:
+        for open_session in sessions.values():
+            open_session.close()
+    return {"ok": True, "written": written, "removed": removed, "problems": problems,
+            "uid": next((d["uid"] for d in done if d.get("uid")), "")}
+
+
+# ---------------------------------------------------------------- file picker
+#
+# The desktop's own "open a file" dialog, through xdg-desktop-portal. Every
+# Omarchy install has it — xdg-desktop-portal-gtk is in its base packages —
+# where zenity is only there if something else happened to pull it in. The
+# portal answers on a Request object with a Response signal, so this waits
+# on a GLib loop for the one answer and prints it.
+
+
+def pick_file(timeout_s: int = 600) -> dict:
+    from gi.repository import Gio, GLib
+    from urllib.parse import unquote, urlparse
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    except Exception as error:
+        raise Failure("picker", f"no session bus for the file picker ({error})")
+    token = "omarcal" + uuid.uuid4().hex
+    sender = bus.get_unique_name()[1:].replace(".", "_")
+    handle = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+    answer = {}
+    loop = GLib.MainLoop()
+
+    def on_response(_conn, _sender, _path, _iface, _signal, params, *_):
+        code, results = params.unpack()
+        answer["code"] = code
+        answer["uris"] = list(results.get("uris", []))
+        loop.quit()
+
+    bus.signal_subscribe("org.freedesktop.portal.Desktop", "org.freedesktop.portal.Request",
+                         "Response", handle, None, Gio.DBusSignalFlags.NO_MATCH_RULE,
+                         on_response)
+    options = {"handle_token": GLib.Variant("s", token),
+               "modal": GLib.Variant("b", True),
+               "multiple": GLib.Variant("b", False)}
+    try:
+        bus.call_sync("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+                      "org.freedesktop.portal.FileChooser", "OpenFile",
+                      GLib.Variant("(ssa{sv})", ("", "Attach a file", options)),
+                      GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, -1, None)
+    except Exception as error:
+        raise Failure("picker", f"the file picker could not open ({error})")
+    GLib.timeout_add_seconds(timeout_s, loop.quit)
+    loop.run()
+
+    if answer.get("code") != 0 or not answer.get("uris"):
+        return {"ok": True, "picked": False}
+    path = unquote(urlparse(answer["uris"][0]).path)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    return {"ok": True, "picked": True, "path": path, "name": os.path.basename(path), "size": size}
+
+
+# --------------------------------------------------------------------- places
+#
+# Addresses for the location field. The calendar's own history is always
+# there and never leaves the machine. A lookup service is only asked when
+# the person has picked one, and the helper checks the setting itself, so
+# a stray command cannot send an address anywhere.
+
+PLACE_PROVIDERS = {
+    # Built for search-as-you-type; free for fair use, no guarantee.
+    "photon": "https://photon.komoot.io/api/?limit=5&q=",
+    # One search at a time only — its usage policy forbids autocomplete —
+    # at most one a second, and with a User-Agent that says who is asking.
+    "nominatim": "https://nominatim.openstreetmap.org/search"
+                 "?format=jsonv2&addressdetails=1&limit=5&q=",
+}
+PLACES_AGENT = "omarcal (+https://github.com/lancefaul/omarchy-omarcal)"
+PLACES_TIMEOUT = 8.0
+
+
+def ics_unescape(value: str) -> str:
+    return re.sub(r"\\([\\,;nN])",
+                  lambda m: "\n" if m.group(1) in "nN" else m.group(1), value)
+
+
+def structured_place(line: str) -> dict | None:
+    """Apple's X-APPLE-STRUCTURED-LOCATION: a title, an address, and a
+    geo: URI with the point it is at."""
+    head, _, value = line.partition(":")
+    geo = re.match(r"(?i)geo:\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)", value.strip())
+    if not geo:
+        return None
+    params = dict(re.findall(r';([A-Za-z-]+)=("[^"]*"|[^;]*)', head))
+    clean = lambda v: ics_unescape((v or "").strip('"'))
+    return {"lat": float(geo.group(1)), "lon": float(geo.group(2)),
+            "title": clean(params.get("X-TITLE")),
+            "address": clean(params.get("X-ADDRESS"))}
+
+
+def places_history(conn) -> list[dict]:
+    """Every distinct location the cached calendar has used, most used
+    first, with the point Apple stored for it when there is one."""
+    seen: dict[str, dict] = {}
+    for ics, first_start in conn.execute("SELECT ics, first_start FROM objects"):
+        text = re.sub(r"\r?\n[ \t]", "", ics)
+        location, place = "", None
+        for line in text.splitlines():
+            if line.startswith("LOCATION") and not location:
+                location = ics_unescape(line.partition(":")[2]).strip()
+            elif line.startswith("X-APPLE-STRUCTURED-LOCATION") and place is None:
+                place = structured_place(line)
+        if not location:
+            continue
+        key = re.sub(r"\s+", " ", location).strip().lower()
+        entry = seen.setdefault(key, {"text": location, "count": 0, "last": 0, "place": None})
+        entry["count"] += 1
+        if first_start >= entry["last"]:
+            entry["last"] = first_start
+            entry["text"] = location
+        if place and not entry["place"]:
+            entry["place"] = place
+    ranked = sorted(seen.values(), key=lambda e: (-e["count"], -e["last"]))
+    return ranked[:2000]
+
+
+def photon_places(data: dict) -> list[dict]:
+    out = []
+    for feature in data.get("features") or []:
+        props = feature.get("properties") or {}
+        coords = (feature.get("geometry") or {}).get("coordinates") or []
+        if len(coords) < 2:
+            continue
+        street = " ".join(x for x in (props.get("housenumber"), props.get("street")) if x)
+        town = ", ".join(x for x in (props.get("city") or props.get("town") or props.get("village"),
+                                     props.get("state"), props.get("postcode")) if x)
+        name = props.get("name") or ""
+        lines = [x for x in (name if name != street else "", street, town, props.get("country")) if x]
+        if not lines:
+            continue
+        out.append({"title": lines[0], "text": ", ".join(lines),
+                    "lat": float(coords[1]), "lon": float(coords[0])})
+    return out
+
+
+def nominatim_places(data: list) -> list[dict]:
+    out = []
+    for hit in data or []:
+        try:
+            lat, lon = float(hit["lat"]), float(hit["lon"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        text = hit.get("display_name") or ""
+        if not text:
+            continue
+        out.append({"title": hit.get("name") or text.split(",")[0],
+                    "text": text, "lat": lat, "lon": lon})
+    return out
+
+
+def search_places(conn, query: str) -> dict:
+    provider = read_settings(conn).get("placesProvider", "none")
+    if provider not in PLACE_PROVIDERS:
+        raise Failure("places-off", "address search is set to the calendar only")
+    text = query.strip()
+    if len(text) < 3:
+        return {"ok": True, "provider": provider, "places": []}
+    host, path = split_url(PLACE_PROVIDERS[provider] + quote(text[:200]))
+    conn_http = http.client.HTTPSConnection(host, timeout=PLACES_TIMEOUT,
+                                            context=ssl.create_default_context())
+    try:
+        conn_http.request("GET", path, headers={"User-Agent": PLACES_AGENT,
+                                                "Accept": "application/json"})
+        resp = conn_http.getresponse()
+        body = resp.read(1024 * 1024)
+    except (OSError, http.client.HTTPException) as failure:
+        raise Failure("places", f"could not reach {provider} ({type(failure).__name__})")
+    finally:
+        conn_http.close()
+    if resp.status == 429:
+        raise Failure("places", f"{provider} asked us to slow down; try again in a moment")
+    if resp.status != 200:
+        raise Failure("places", f"{provider} answered HTTP {resp.status}")
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        raise Failure("places", f"{provider} sent something that is not JSON")
+    places = photon_places(data) if provider == "photon" else nominatim_places(data)
+    return {"ok": True, "provider": provider, "places": places}
+
+
+def contact_list(conn) -> dict:
+    if not contacts_enabled(conn):
+        return {"enabled": False, "contacts": [], "count": 0, "error": ""}
+    rows = conn.execute(
+        "SELECT name, email FROM contacts GROUP BY lower(email) "
+        "ORDER BY lower(name), lower(email)").fetchall()
+    errors = [r[0] for r in conn.execute(
+        "SELECT error FROM contact_state WHERE error != ''")]
+    return {"enabled": True, "count": len(rows), "error": errors[0] if errors else "",
+            "contacts": [{"name": r[0], "email": r[1]} for r in rows]}
+# -------------------------------------------------------------- update check
+#
+# The daily "is there a newer release" question, asked here rather than in
+# the shell: the shell is long-lived, and a request it makes has to be
+# bounded in time and in size or a stalled or oversized answer hangs it or
+# fills its memory. Here every read has a timeout, the whole exchange has a
+# deadline, and the answer is capped before it is buffered — refused on its
+# declared length, and again on what actually arrives.
+
+RELEASES_API = "https://api.github.com/repos/lancefaul/omarchy-omarcal/releases/latest"
+RELEASES_AGENT = "omarcal (+https://github.com/lancefaul/omarchy-omarcal)"
+UPDATE_TIMEOUT = 10.0          # seconds, for connecting and for each read
+UPDATE_DEADLINE = 20.0         # seconds, for the whole exchange
+UPDATE_MAX_BYTES = 256 * 1024  # a release answer is a few KB
+
+
+def update_check(url: str = RELEASES_API) -> dict:
+    host, path = split_url(url)
+    started = time.monotonic()
+    conn = http.client.HTTPSConnection(host, timeout=UPDATE_TIMEOUT,
+                                       context=ssl.create_default_context())
+    try:
+        conn.request("GET", path, headers={"User-Agent": RELEASES_AGENT,
+                                           "Accept": "application/vnd.github+json"})
+        resp = conn.getresponse()
+        if resp.status == 404:
+            return {"ok": True, "status": 404}
+        if resp.status != 200:
+            return {"ok": False, "code": "update", "error": f"GitHub answered HTTP {resp.status}"}
+        declared = resp.getheader("Content-Length")
+        if declared and declared.isdigit() and int(declared) > UPDATE_MAX_BYTES:
+            return {"ok": False, "code": "update", "error": "GitHub's answer was too large"}
+        body = bytearray()
+        while len(body) <= UPDATE_MAX_BYTES:
+            if time.monotonic() - started > UPDATE_DEADLINE:
+                return {"ok": False, "code": "update", "error": "GitHub took too long to answer"}
+            chunk = resp.read(min(16384, UPDATE_MAX_BYTES + 1 - len(body)))
+            if not chunk:
+                break
+            body.extend(chunk)
+        if len(body) > UPDATE_MAX_BYTES:
+            return {"ok": False, "code": "update", "error": "GitHub's answer was too large"}
+        return {"ok": True, "status": 200, "body": body.decode("utf-8", "replace")}
+    except (OSError, http.client.HTTPException) as error:
+        return {"ok": False, "code": "update",
+                "error": f"GitHub could not be reached ({type(error).__name__})"}
+    finally:
+        conn.close()
 
 
 def parse_when(value: str) -> datetime:
@@ -1104,6 +2844,9 @@ def main(argv: list[str]) -> int:
         "login", "reveal-password", "accounts", "remove-account",
         "calendars", "set-calendar", "forget-calendar", "sync",
         "events", "event", "search", "agenda", "status", "settings", "watch",
+        "contacts", "contacts-sync", "contacts-forget", "places-history", "places",
+        "save", "delete", "pick-file", "zones", "flush", "pending-dismiss",
+        "update-check",
     ])
     ap.add_argument("--user", default=os.environ.get("OMARCAL_USER", ""))
     ap.add_argument("--server", default=ICLOUD)
@@ -1113,6 +2856,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--to", dest="end", default="")
     ap.add_argument("--uid", default="")
     ap.add_argument("--rid", default="")
+    ap.add_argument("--at", default="")
+    ap.add_argument("--id", type=int, default=0)
     ap.add_argument("--query", default="")
     ap.add_argument("--limit", type=int, default=50)
     ap.add_argument("--days", type=int, default=7)
@@ -1197,6 +2942,10 @@ def dispatch(conn, args) -> dict:
         for url in urls:
             conn.execute("DELETE FROM objects WHERE calendar=?", (url,))
         conn.execute("DELETE FROM calendars WHERE account=?", (args.user,))
+        # Its contacts go with it: they were only kept to suggest invitees
+        # for this account's events.
+        conn.execute("DELETE FROM contacts WHERE account=?", (args.user,))
+        conn.execute("DELETE FROM contact_state WHERE account=?", (args.user,))
         removed = conn.execute("DELETE FROM accounts WHERE user=?", (args.user,)).rowcount
         conn.commit()
         forget_password(args.user)
@@ -1255,7 +3004,7 @@ def dispatch(conn, args) -> dict:
     if args.command == "event":
         if not args.uid:
             raise Failure("usage", "--uid is required")
-        return event_detail(conn, args.uid, args.rid)
+        return event_detail(conn, args.uid, args.rid, args.at)
 
     if args.command == "search":
         if not args.query:
@@ -1265,6 +3014,9 @@ def dispatch(conn, args) -> dict:
     if args.command == "agenda":
         start = datetime.now(LOCAL_TZ)
         return events(conn, start, start + timedelta(days=args.days), args.only)
+
+    if args.command == "update-check":
+        return update_check()
 
     if args.command == "status":
         return status(conn)
@@ -1282,7 +3034,53 @@ def dispatch(conn, args) -> dict:
                 (key, json.dumps(value)),
             )
         conn.commit()
+        # Switching contacts off deletes them here, whatever asked for it,
+        # so "off deletes them" does not depend on the panel remembering to.
+        if not contacts_enabled(conn):
+            forget_contacts(conn)
         return {"ok": True, "settings": read_settings(conn)}
+
+    if args.command == "contacts":
+        return {"ok": True, **contact_list(conn)}
+
+    if args.command == "contacts-sync":
+        return sync_contacts(conn)
+
+    if args.command == "contacts-forget":
+        return {"ok": True, "forgotten": forget_contacts(conn)}
+
+    # One JSON object on one line of stdin: a QML Process cannot close its
+    # stdin, so reading to EOF would wait forever (see `login`).
+    if args.command in ("save", "delete"):
+        line = sys.stdin.readline()
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError:
+            raise Failure("usage", "save and delete read one line of JSON on stdin")
+        return write_event(conn, request, args.command == "delete")
+
+    if args.command == "flush":
+        return {"ok": True, **flush_pending(conn), **pending_status(conn)}
+
+    # A change that could not be sent, let go of: it was already taken off
+    # the display when it was refused.
+    if args.command == "pending-dismiss":
+        conn.execute("DELETE FROM pending_backup WHERE pending_id=?", (args.id,))
+        conn.execute("DELETE FROM pending WHERE id=? AND state='conflict'", (args.id,))
+        conn.commit()
+        return {"ok": True, **pending_status(conn)}
+
+    if args.command == "zones":
+        return {"ok": True, "local": local_zone_name(), "zones": zone_list()}
+
+    if args.command == "pick-file":
+        return pick_file()
+
+    if args.command == "places-history":
+        return {"ok": True, "places": places_history(conn)}
+
+    if args.command == "places":
+        return search_places(conn, args.query)
 
     if args.command == "watch":
         interval = args.interval or read_settings(conn)["refreshMinutes"] * 60
