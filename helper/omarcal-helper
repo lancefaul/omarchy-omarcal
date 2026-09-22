@@ -40,6 +40,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from xml.etree import ElementTree as ET
 
 import gi
@@ -71,7 +72,29 @@ STATE_DIR = os.path.join(
 )
 DB_PATH = os.path.join(STATE_DIR, "cache.db")
 
-LOCAL_TZ = datetime.now().astimezone().tzinfo
+def system_zone():
+    """The machine's zone with its rules, not today's offset.
+
+    `datetime.now().astimezone().tzinfo` is a fixed offset — whatever the
+    clocks say today — so every event on the far side of a DST change came
+    out an hour off: in September, a November 6:15 PM game read 7:15 PM.
+    """
+    try:
+        target = os.path.realpath("/etc/localtime")
+        if "/zoneinfo/" in target:
+            return ZoneInfo(target.split("/zoneinfo/", 1)[1])
+    except Exception:
+        pass
+    name = os.environ.get("TZ", "").lstrip(":")
+    if name:
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            pass
+    return datetime.now().astimezone().tzinfo
+
+
+LOCAL_TZ = system_zone()
 
 MEETING_PATTERNS = [
     ("zoom", re.compile(r"https://[\w.-]*zoom\.us/\S+", re.I)),

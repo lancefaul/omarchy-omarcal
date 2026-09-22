@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "lancefaul.omarcal",
   "name": "omarcal",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "lancefaul",
   "license": "MIT",
   "description": "Your iCloud calendar in the bar: month, week and day views, an event viewer and search. Read-only for now \u2014 editing and more providers are coming.",

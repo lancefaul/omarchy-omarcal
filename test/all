@@ -15,6 +15,12 @@ for suite in tests/tst_*.qml; do
   grep -q 'FAIL' <<<"$output" && status=1
 done
 
+# The helper's own suite, offline.
+printf '\n== tests/helper\n'
+output=$(python3 -B -m unittest discover -s tests/helper -p 'test_*.py' 2>&1 | grep -v g_uri_join)
+tail -n 1 <<<"$output"
+grep -qE '^OK' <<<"$(tail -n 1 <<<"$output")" || { echo "$output"; status=1; }
+
 printf '\n'
 [ $status -eq 0 ] && echo "all suites passed" || echo "FAILURES"
 exit $status
